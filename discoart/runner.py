@@ -13,6 +13,7 @@ import torch
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from docarray import DocumentArray, Document
+from rich.text import Text
 
 from .config import print_args_table
 from .helper import logger, PromptParser, get_ipython_funcs
@@ -38,8 +39,6 @@ def do_run(args, models, device) -> 'DocumentArray':
 
     schedule_table = _get_schedule_table(args)
 
-    from .nn.perlin_noises import create_perlin_noise, regen_perlin
-
     skip_steps = args.skip_steps
 
     loss_values = []
@@ -55,101 +54,17 @@ def do_run(args, models, device) -> 'DocumentArray':
     pmp = PromptParser(on_misspelled_token=args.on_misspelled_token)
     txt_weights = [pmp.parse(prompt) for prompt in args.text_prompts]
 
-    for model_name, clip_model in clip_models.items():
-
-        # when using SLIP Base model the dimensions need to be hard coded to avoid AttributeError: 'VisionTransformer' object has no attribute 'input_resolution'
-        try:
-            input_resolution = clip_model.visual.input_resolution
-        except:
-            input_resolution = 224
-
-        schedules = [True] * _MAX_DIFFUSION_STEPS
-        if args.clip_models_schedules and model_name in args.clip_models_schedules:
-            schedules = _eval_scheduling_str(args.clip_models_schedules[model_name])
-
-        model_stat = {
-            'clip_model': clip_model,
-            'target_embeds': [],
-            'weights': [],
-            'schedules': schedules,
-            'input_resolution': input_resolution,
-        }
-
-        for txt, weight in txt_weights:
-            txt = clip_model.encode_text(clip.tokenize(txt).to(device)).float()
-
-            if args.fuzzy_prompt:
-                for _ in range(25):
-                    model_stat['target_embeds'].append(
-                        (txt + torch.randn(txt.shape).cuda() * args.rand_mag).clamp(
-                            0, 1
-                        )
-                    )
-                    model_stat['weights'].append(weight)
-            else:
-                model_stat['target_embeds'].append(txt)
-                model_stat['weights'].append(weight)
-
-        sum_weight = abs(sum(model_stat['weights']))
-        if sum_weight < 1e-3:
-            raise ValueError(
-                f'The sum of all weights in the prompts must *not* be 0 but sum({model_stat["weights"]})={sum_weight}'
-            )
-        model_stat['target_embeds'] = torch.cat(model_stat['target_embeds'])
-        model_stat['weights'] = torch.tensor(model_stat['weights'], device=device)
-        model_stat['weights'] /= sum_weight
-        model_stats.append(model_stat)
+    prepare_clip_models(args, clip_models, device, model_stats, txt_weights)
 
     init = None
     if args.init_image:
-        d = Document(uri=args.init_image).load_uri_to_image_tensor(side_x, side_y)
-        init = TF.to_tensor(d.tensor).to(device).unsqueeze(0).mul(2).sub(1)
+        document = Document(uri=args.init_image).load_uri_to_image_tensor(side_x, side_y)
+
+        init = TF.to_tensor(document.tensor).to(device).unsqueeze(0).mul(2).sub(1)
 
     if args.perlin_init:
-        if args.perlin_mode == 'color':
-            init = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(12)],
-                1,
-                1,
-                False,
-                side_y,
-                side_x,
-                device,
-            )
-            init2 = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(8)], 4, 4, False, side_y, side_x, device
-            )
-        elif args.perlin_mode == 'gray':
-            init = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(12)], 1, 1, True, side_y, side_x, device
-            )
-            init2 = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(8)], 4, 4, True, side_y, side_x, device
-            )
-        else:
-            init = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(12)],
-                1,
-                1,
-                False,
-                side_y,
-                side_x,
-                device,
-            )
-            init2 = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(8)], 4, 4, True, side_y, side_x, device
-            )
-        # init = TF.to_tensor(init).add(TF.to_tensor(init2)).div(2).to(device)
-        init = (
-            TF.to_tensor(init)
-            .add(TF.to_tensor(init2))
-            .div(2)
-            .to(device)
-            .unsqueeze(0)
-            .mul(2)
-            .sub(1)
-        )
-        del init2
+        init = create_perlin_init(args, device, side_x, side_y)
+
 
     cur_t = None
 
@@ -264,16 +179,15 @@ def do_run(args, models, device) -> 'DocumentArray':
     is_busy_evs = [threading.Event(), threading.Event()]
 
     da_batches = DocumentArray()
-    from rich.text import Text
 
     org_seed = args.seed
-    for _nb in range(args.n_batches):
+    for num_batch in range(args.n_batches):
 
         # set seed for each image in the batch
-        new_seed = org_seed + _nb
+        new_seed = org_seed + num_batch
         _set_seed(new_seed)
         args.seed = new_seed
-        pgbar = '▰' * (_nb + 1) + '▱' * (args.n_batches - _nb - 1)
+        pgbar = '▰' * (num_batch + 1) + '▱' * (args.n_batches - num_batch - 1)
 
         _dp1.display(
             Text(f'n_batches={args.n_batches}: {pgbar}'),
@@ -283,8 +197,8 @@ def do_run(args, models, device) -> 'DocumentArray':
         gc.collect()
         torch.cuda.empty_cache()
 
-        d = Document(tags=vars(args))
-        da_batches.append(d)
+        document = Document(tags=vars(args))
+        da_batches.append(document)
 
         cur_t = diffusion.num_timesteps - skip_steps - 1
 
@@ -333,19 +247,19 @@ def do_run(args, models, device) -> 'DocumentArray':
                         image = TF.to_pil_image(image.add(1).div(2).clamp(0, 1))
                         c = Document(tags={'cur_t': cur_t})
                         c.load_pil_image_to_datauri(image)
-                        d.chunks.append(c)
+                        document.chunks.append(c)
                         _dp1.clear_output(wait=True)
                         _dp1.display(image)
-                        d.chunks.plot_image_sprites(
-                            f'{args.name_docarray}-progress-{_nb}.png',
+                        document.chunks.plot_image_sprites(
+                            f'{args.name_docarray}-progress-{num_batch}.png',
                             skip_empty=True,
                             show_index=True,
                             keep_aspect_ratio=True,
                         )
 
                     # root doc always update with the latest progress
-                    d.uri = c.uri
-                    d.tags['completed'] = cur_t == -1
+                    document.uri = c.uri
+                    document.tags['completed'] = cur_t == -1
                     _start_persist(
                         threads,
                         da_batches,
@@ -361,6 +275,103 @@ def do_run(args, models, device) -> 'DocumentArray':
     logger.info(f'done! {args.name_docarray}')
 
     return da_batches
+
+
+def prepare_clip_models(args, clip_models, device, model_stats, txt_weights):
+    for model_name, clip_model in clip_models.items():
+
+        # when using SLIP Base model the dimensions need to be hard coded to avoid AttributeError: 'VisionTransformer' object has no attribute 'input_resolution'
+        try:
+            input_resolution = clip_model.visual.input_resolution
+        except:
+            input_resolution = 224
+
+        schedules = [True] * _MAX_DIFFUSION_STEPS
+        if args.clip_models_schedules and model_name in args.clip_models_schedules:
+            schedules = _eval_scheduling_str(args.clip_models_schedules[model_name])
+
+        model_stat = {
+            'clip_model': clip_model,
+            'target_embeds': [],
+            'weights': [],
+            'schedules': schedules,
+            'input_resolution': input_resolution,
+        }
+
+        for txt, weight in txt_weights:
+            txt = clip_model.encode_text(clip.tokenize(txt).to(device)).float()
+
+            if args.fuzzy_prompt:
+                for _ in range(25):
+                    model_stat['target_embeds'].append(
+                        (txt + torch.randn(txt.shape).cuda() * args.rand_mag).clamp(
+                            0, 1
+                        )
+                    )
+                    model_stat['weights'].append(weight)
+            else:
+                model_stat['target_embeds'].append(txt)
+                model_stat['weights'].append(weight)
+
+        sum_weight = abs(sum(model_stat['weights']))
+        if sum_weight < 1e-3:
+            raise ValueError(
+                f'The sum of all weights in the prompts must *not* be 0 but sum({model_stat["weights"]})={sum_weight}'
+            )
+        model_stat['target_embeds'] = torch.cat(model_stat['target_embeds'])
+        model_stat['weights'] = torch.tensor(model_stat['weights'], device=device)
+        model_stat['weights'] /= sum_weight
+        model_stats.append(model_stat)
+
+
+def create_perlin_init(args, device, side_x, side_y):
+    from .nn.perlin_noises import create_perlin_noise, regen_perlin
+
+    if args.perlin_mode == 'color':
+        init = create_perlin_noise(
+            [1.5 ** -i * 0.5 for i in range(12)],
+            1,
+            1,
+            False,
+            side_y,
+            side_x,
+            device,
+        )
+        init2 = create_perlin_noise(
+            [1.5 ** -i * 0.5 for i in range(8)], 4, 4, False, side_y, side_x, device
+        )
+    elif args.perlin_mode == 'gray':
+        init = create_perlin_noise(
+            [1.5 ** -i * 0.5 for i in range(12)], 1, 1, True, side_y, side_x, device
+        )
+        init2 = create_perlin_noise(
+            [1.5 ** -i * 0.5 for i in range(8)], 4, 4, True, side_y, side_x, device
+        )
+    else:
+        init = create_perlin_noise(
+            [1.5 ** -i * 0.5 for i in range(12)],
+            1,
+            1,
+            False,
+            side_y,
+            side_x,
+            device,
+        )
+        init2 = create_perlin_noise(
+            [1.5 ** -i * 0.5 for i in range(8)], 4, 4, True, side_y, side_x, device
+        )
+    # init = TF.to_tensor(init).add(TF.to_tensor(init2)).div(2).to(device)
+    init = (
+        TF.to_tensor(init)
+        .add(TF.to_tensor(init2))
+        .div(2)
+        .to(device)
+        .unsqueeze(0)
+        .mul(2)
+        .sub(1)
+    )
+    del init2
+    return init
 
 
 def _start_persist(threads, da_batches, name_docarray, is_busy_evs, force):
