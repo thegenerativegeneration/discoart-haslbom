@@ -18,15 +18,15 @@ Disco Diffusion is a Google Colab Notebook that leverages CLIP-Guided Diffusion 
 </sup></sub>
 
 
-💯 **Best-in-class**: top-notch code quality, correctness-first, minimum dependencies; including bug fixes, feature improvements [vs. the original DD5.5](FEATURES.md). 
+💯 **Best-in-class**: top-notch code quality, correctness-first, minimum dependencies; including bug fixes, feature improvements [vs. the original DD5.6](FEATURES.md). 
 
-👼 **Available to all**: smooth install for *self-hosting*, Google Colab *free tier*, and non-GUI (IPython) environment! No brainfuck, no dependency hell, no stackoverflow. 
+👼 **Available to all**: smooth install for *self-hosting*, Google Colab *free tier*, non-GUI (IPython) environment, and CLI! No brainfuck, no dependency hell, no stackoverflow. 
 
 🎨 **Focus on create not code**: one-liner `create()` with a Pythonic interface, autocompletion in IDE, and powerful features. Fetch real-time results anywhere anytime, no more worry on session outrage on Google Colab. Set initial state easily for more efficient parameter exploration.
 
 🏭 **Ready for integration & production**: built on top of [DocArray](https://github.com/jina-ai/docarray) data structure, enjoy smooth integration with [Jina](https://github.com/jina-ai/jina), [CLIP-as-service](https://github.com/jina-ai/clip-as-service) and other cross-/multi-modal applications.
 
-☁️ [**As-a-service**](#serving): simply `python -m discoart.serve`, DiscoArt is now a high-performance low-latency service supports gRPC/HTTP/websockets and TLS. Scaling up/down is one-line; Cloud-native features e.g. Kubernetes, Prometheus and Grafana is one-line. [Unbelievable simple thanks to Jina](https://github.com/jina-ai/jina).
+☁️ [**As-a-service**](#serving): simply `python -m discoart serve`, DiscoArt is now a high-performance low-latency service supports gRPC/HTTP/websockets and TLS. Scaling up/down is one-line; Cloud-native features e.g. Kubernetes, Prometheus and Grafana is one-line. [Unbelievable simple thanks to Jina](https://github.com/jina-ai/jina).
 
 
 ## [Gallery with prompts](https://twitter.com/hxiao/status/1542967938369687552?s=20&t=DO27EKNMADzv4WjHLQiPFA) 
@@ -38,10 +38,12 @@ Python 3.7+ and CUDA-enabled PyTorch is required.
 pip install discoart
 ```
 
-This applies to both *self-hosting*, *Google Colab* and non-GUI environments.
+This applies to both *self-hosting*, *Google Colab*, system integration, non-GUI environments.
 
-- **Self-hosted Jupyter**: if you want to use it in a Jupyter Notebook on your own GPU machine, the easiest way is to [use our prebuilt Docker image](#run-in-docker).
-- **Using it as a service**: [`python -m discoart.serve`](#serving)
+- **Self-hosted Jupyter**: to run a Jupyter Notebook on your own GPU machine, the easiest way is to [use our prebuilt Docker image](#run-in-docker).
+- **Use it from CLI**: [`python -m discoart create`](#cli) and `python -m discoart config` are CLI commands.
+- **Use it as a service**: [`python -m discoart serve`](#serving) allows one to run it as gRPC/HTTP/websockets service.
+
 
 ## Get Started
 
@@ -83,12 +85,30 @@ from discoart import cheatsheet
 cheatsheet()
 ```
 
-The difference on the parameters between DiscoArt and DD5.5 [is explained here](./FEATURES.md). 
+The difference on the parameters between DiscoArt and DD5.6 [is explained here](./FEATURES.md). 
 
 
 ### Visualize results
 
-`create()` returns `da`, a [DocumentArray](https://docarray.jina.ai/fundamentals/documentarray/)-type object. It contains the following information:
+Final results and intermediate results are created under the current working directory, e.g.
+```text
+./{name-docarray}/{i}-step-{j}.png
+./{name-docarray}/{i}-progress.png
+./{name-docarray}/{i}-done.png
+```
+
+![](.github/result-persist.png)
+
+where:
+
+- `name-docarray` is the name of the run, you can specify it otherwise it is a random name.
+- `i-*` is up to the value of `n_batches`.
+- `*-done-*` is the final image on done.
+- `*-step-*` is the intermediate image at certain step.
+- `*-progress-*` is the sprite image of all intermediate results so far.
+
+
+Moreover, `create()` returns `da`, a [DocumentArray](https://docarray.jina.ai/fundamentals/documentarray/)-type object. It contains the following information:
 - All arguments passed to `create()` function, including seed, text prompts and model parameters.
 - 4 generated image and its intermediate steps' images, where `4` is determined by `n_batches` and is the default value. 
 
@@ -199,45 +219,64 @@ create(
 
 ### Environment variables
 
-You can set environment variables to control the behavior of DiscoArt. The environment variables must be set before importing DiscoArt:
+You can set environment variables to control the meta-behavior of DiscoArt. The environment variables must be set before importing DiscoArt, either in Bash or in Python via `os.environ`.
 
 ```bash
 DISCOART_LOG_LEVEL='DEBUG' # more verbose logs
 DISCOART_OPTOUT_CLOUD_BACKUP='1' # opt-out from cloud backup
 DISCOART_DISABLE_IPYTHON='1' # disable ipython dependency
 DISCOART_DISABLE_RESULT_SUMMARY='1' # disable result summary after the run ends
+DISCOART_DEFAULT_PARAMETERS_YAML='path/to/your-default.yml' # use a custom default parameters file
+DISCOART_CUT_SCHEDULES_YAML='path/to/your-schedules.yml' # use a custom cut schedules file
+DISCOART_MODELS_YAML='path/to/your-models.yml' # use a custom list of models file
 ```
 
-### Run in Docker
+## CLI
 
-[![Docker Image Size (tag)](https://img.shields.io/docker/image-size/jinaai/discoart/latest?logo=docker&logoColor=white&style=flat-square)](https://hub.docker.com/repository/docker/jinaai/discoart)
-
-We provide a prebuilt Docker image for running DiscoArt in the Jupyter Notebook. 
+DiscoArt provides two commands `create` and `config` that allows you to run DiscoArt from CLI.
 
 ```bash
-# docker build . -t jinaai/discoart  # if you want to build yourself
-docker run -p 51000:8888 -v $(pwd):/home/jovyan/ -v $HOME/.cache:/root/.cache --gpus all jinaai/discoart
+python -m discoart create my.yml
 ```
 
-To update Docker image to latest version:
+which creates artworks from the YAML config file `my.yml`. You can also do:
 
 ```bash
-docker pull jinaai/discoart:latest
+cat config.yml | python -m discoart create
 ```
 
-[Docker images are built on every release](https://hub.docker.com/repository/docker/jinaai/discoart), so one can lock it to a specific version, say `0.5.1`:
+So how can I have my own `my.yml` and what does it look like? That's the second command:
 
 ```bash
-docker run -p 51000:8888 -v $(pwd):/home/jovyan/ -v $HOME/.cache:/root/.cache --gpus all jinaai/discoart:0.5.1
+python -m discoart config my.yml
 ```
 
+which forks the [default YAML config](discoart/resources/default.yml) and export them to `my.yml`. Now you can modify it and run it with `python -m discoart create` command.
+
+If no output path is specified, then `python -m discoart config` will print the default config to stdout.
+
+To get help on a command, add `--help` at the end, e.g.:
+
+```bash
+python -m discoart create --help
+```
+
+```text
+usage: python -m discoart create [-h] [YAML_CONFIG_FILE]
+
+positional arguments:
+  YAML_CONFIG_FILE  The YAML config file to use, default is stdin.
+
+optional arguments:
+  -h, --help        show this help message and exit
+```
 
 ## Serving
 
 Serving DiscoArt is super easy. Simply run the following command:
 
 ```bash
-python -m discoart.serve
+python -m discoart serve
 ```
 
 You shall see:
@@ -282,17 +321,21 @@ executors:
 
 Here `replicas: 3` says spawning three DiscoArt instances, `CUDA_VISIBLE_DEVICES: RR0:3` makes sure they use the first three GPUs in a round-robin fashion.
 
-Name it as `myflow.yml` and then run `python -m discoart.serve myflow.yml` again.
+Name it as `myflow.yml` and then run 
+
+```bash
+python -m discoart serve myflow.yml
+```
 
 ### Customization
 
-You can change the port number; change protocol to gRPC/Websockets; add TLS encryption; enable/disable Prometheus monitoring; you can also export it to Kubernetes deployment bundle simply via:
+[Thanks to Jina](https://github.com/jina-ai/jina), there are tons of things you can customize! You can change the port number; change protocol to gRPC/Websockets; add TLS encryption; enable/disable Prometheus monitoring; you can also export it to Kubernetes deployment bundle simply via:
 
 ```bash
 jina export kubernetes myflow.yml
 ```
 
-For more features and YAML configs, [please check out Jina](https://github.com/jina-ai/jina).
+For more features and YAML configs, [please check out Jina docs](https://docs.jina.ai).
 
 
 ### Hosting on Google Colab
@@ -302,11 +345,54 @@ Please check out the following tutorials:
 - https://docs.jina.ai/how-to/google-colab/
 - https://clip-as-service.jina.ai/hosting/colab/
 
+
+
+
+
+## Run in Docker
+
+[![Docker Image Size (tag)](https://img.shields.io/docker/image-size/jinaai/discoart/latest?logo=docker&logoColor=white&style=flat-square)](https://hub.docker.com/repository/docker/jinaai/discoart)
+
+We provide a prebuilt Docker image for running DiscoArt out of the box. To update Docker image to latest version:
+
+```bash
+docker pull jinaai/discoart:latest
+```
+
+### Use Jupyter notebook
+
+The default entrypoint is starting a Jupyter notebook
+
+```bash
+# docker build . -t jinaai/discoart  # if you want to build yourself
+docker run -p 51000:8888 -v $(pwd):/home/jovyan/ -v $HOME/.cache:/root/.cache --gpus all jinaai/discoart
+```
+
+Now you can visit `http://127.0.0.1:51000` to access the notebook
+
+### Use as a service
+
+```bash
+# docker build . -t jinaai/discoart  # if you want to build yourself
+docker run --entrypoint "python -m discoart serve" -p 51001:51001 -v $(pwd):/home/jovyan/ -v $HOME/.cache:/root/.cache --gpus all jinaai/discoart
+```
+
+Your DiscoArt server is now running at `http://127.0.0.1:51001`.
+
+### Release cycle
+
+[Docker images are built on every release](https://hub.docker.com/repository/docker/jinaai/discoart), so one can lock it to a specific version, say `0.5.1`:
+
+```bash
+docker run -p 51000:8888 -v $(pwd):/home/jovyan/ -v $HOME/.cache:/root/.cache --gpus all jinaai/discoart:0.5.1
+```
+
+
 ## What's next?
 
 [Next is create](https://colab.research.google.com/github/jina-ai/discoart/blob/main/discoart.ipynb).
 
-😎 **If you are already a DD user**: you are ready to go! There is no extra learning, DiscoArt respects the same parameter semantics as DD5.5. So just unleash your creativity! [Read more about their differences here](./FEATURES.md)
+😎 **If you are already a DD user**: you are ready to go! There is no extra learning, DiscoArt respects the same parameter semantics as DD5.6. So just unleash your creativity! [Read more about their differences here](./FEATURES.md).
 
 You can always do `from discoart import cheatsheet; cheatsheet()` to check all new/modified parameters.
 

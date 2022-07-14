@@ -25,7 +25,9 @@ from yaml import Loader
 
 from . import __resources_path__
 
-with open(f'{__resources_path__}/models.yml') as ymlfile:
+with open(
+    os.environ.get('DISCOART_MODELS_YAML', f'{__resources_path__}/models.yml')
+) as ymlfile:
     models_list = yaml.load(ymlfile, Loader=Loader)
 
 
@@ -38,8 +40,8 @@ def get_device():
         device = torch.device('cpu')
         warnings.warn(
             '''
-            !!!!CUDA is not available. DiscoArt is running on CPU. `create()` will be unbearably slow on CPU!!!!
-            Please switch to a GPU device. If you are using Google Colab, then free tier would just work.
+!!!!CUDA is not available. DiscoArt is running on CPU. `create()` will be unbearably slow on CPU!!!!
+Please switch to a GPU device. If you are using Google Colab, then free tier would just work.
             '''
         )
     return device
@@ -477,23 +479,21 @@ To save the full-size images, please check out the instruction in the next secti
 
 # 🖼️ Save images
 
-There are two ways to save the HD images:
-
-```python
-da[0].display()
-``` 
-
-and then right-click "Download image".
-
-Or:
-
+Final results and intermediate results are created under the current working directory, e.g.
+```text
+./{_name}/[i]-step-[i].png
+./{_name}/[i]-progress.png
+./{_name}/[i]-done.png
 ```
-da[0].save_uri_to_file('filename.png')
-``` 
 
-and find `filename.png` in your filesystem. On Google Colab, open the left panel of "file structure" and you shall see it.
+where:
 
-`da[0]` represents the first image in your batch. You can save the 2nd, 3rd, etc. image by using `da[1]`, `da[2]`, etc.  
+- `name-docarray` is the name of the run, you can specify it otherwise it is a random name.
+- `i-*` is up to the value of `n_batches`.
+- `*-done-*` is the final image on done.
+- `*-step-*` is the intermediate image at certain step.
+- `*-progress-*` is the sprite image of all intermediate results so far.
+
 
 # 💾 Save & load the batch        
 

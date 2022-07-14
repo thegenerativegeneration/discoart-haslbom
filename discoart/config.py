@@ -1,4 +1,5 @@
 import copy
+import os
 import random
 from typing import Dict, Union, Optional
 
@@ -8,10 +9,18 @@ from yaml import Loader
 
 from . import __resources_path__
 
-with open(f'{__resources_path__}/default.yml') as ymlfile:
+with open(
+    os.environ.get(
+        'DISCOART_DEFAULT_PARAMETERS_YAML', f'{__resources_path__}/default.yml'
+    )
+) as ymlfile:
     default_args = yaml.load(ymlfile, Loader=Loader)
 
-with open(f'{__resources_path__}/cut-schedules.yml') as ymlfile:
+with open(
+    os.environ.get(
+        'DISCOART_CUT_SCHEDULES_YAML', f'{__resources_path__}/cut-schedules.yml'
+    )
+) as ymlfile:
     cut_schedules = yaml.load(ymlfile, Loader=Loader)
 
 
@@ -59,7 +68,8 @@ def load_config(
 
         logger.debug('you did not set `batch_name`, set it to have unique session ID')
 
-    cfg.update(**{'name_docarray': da_name})
+    if not cfg.get('name_docarray', None):
+        cfg['name_docarray'] = da_name
 
     return cfg
 
@@ -87,7 +97,8 @@ def save_config_svg(
     from rich.terminal_theme import MONOKAI
 
     console = Console(record=True)
-    print_args_table(load_config(cfg), console)
+    cfg = load_config(cfg)
+    print_args_table(cfg, console)
     console.save_svg(
         output or f'{cfg["name_docarray"]}.svg',
         theme=MONOKAI,
@@ -142,8 +153,6 @@ def cheatsheet():
 
     console = Console()
 
-    with open(f'{__resources_path__}/default.yml') as ymlfile:
-        cfg = yaml.load(ymlfile, Loader=Loader)
     with open(f'{__resources_path__}/docstrings.yml') as ymlfile:
         docs = yaml.load(ymlfile, Loader=Loader)
 
@@ -158,7 +167,7 @@ def cheatsheet():
     param_tab.add_column('Default', justify='left', max_width=10, overflow='fold')
     param_tab.add_column('Description', justify='left')
 
-    for k, v in sorted(cfg.items()):
+    for k, v in sorted(default_args.items()):
         value = str(v)
         if k in docs:
             d_string = docs[k]
