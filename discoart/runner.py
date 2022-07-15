@@ -211,6 +211,7 @@ def do_run(args, models, device) -> 'DocumentArray':
         cur_t = diffusion.num_timesteps - skip_steps - 1
 
         if args.perlin_init:
+            from discoart.nn.perlin_noises import regen_perlin
             init = regen_perlin(
                 args.perlin_mode, side_y, side_x, device, args.batch_size
             )
@@ -340,7 +341,7 @@ def prepare_clip_models(args, clip_models, device, model_stats, txt_weights):
 
 
 def create_perlin_init(args, device, side_x, side_y):
-    from .nn.perlin_noises import create_perlin_noise, regen_perlin
+    from .nn.perlin_noises import create_perlin_noise
 
     if args.perlin_mode == 'color':
         init = create_perlin_noise(
