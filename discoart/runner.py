@@ -1,3 +1,4 @@
+import copy
 import gc
 import os
 import random
@@ -204,7 +205,7 @@ def do_run(args, models, device) -> 'DocumentArray':
         gc.collect()
         torch.cuda.empty_cache()
 
-        document = Document(tags=vars(args))
+        document = Document(tags=copy.deepcopy(vars(args)))
         da_batches.append(document)
 
         cur_t = diffusion.num_timesteps - skip_steps - 1
@@ -250,9 +251,9 @@ def do_run(args, models, device) -> 'DocumentArray':
             cur_t -= 1
             with image_display:
                 if j % args.display_rate == 0 or cur_t == -1:
-                    for _, image in enumerate(sample['pred_xstart']):
+                    for image in sample['pred_xstart']:
                         image = TF.to_pil_image(image.add(1).div(2).clamp(0, 1))
-                        c = Document(tags={'cur_t': cur_t})
+                        c = Document(tags={'_status': {'cur_t': cur_t, 'step': j}})
                         c.load_pil_image_to_datauri(image)
                         document.chunks.append(c)
                         _dp1.clear_output(wait=True)
@@ -267,7 +268,11 @@ def do_run(args, models, device) -> 'DocumentArray':
 
                     # root doc always update with the latest progress
                     document.uri = c.uri
-                    document.tags['completed'] = cur_t == -1
+                    document.tags['_status'] = {
+                        'completed': cur_t == -1,
+                        'cur_t': cur_t,
+                        'step': j,
+                    }
                     if cur_t == -1:
                         document.save_uri_to_file(f'{output_dir}/{num_batch}-done.png')
                     _start_persist(
