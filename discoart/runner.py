@@ -73,7 +73,6 @@ def do_run(args, models, device) -> 'DocumentArray':
     if args.perlin_init:
         init = create_perlin_init(args, device, side_x, side_y)
 
-
     cur_t = None
 
     def cond_fn(x, t, y=None):
@@ -112,10 +111,10 @@ def do_run(args, models, device) -> 'DocumentArray':
                 x_in_grad = torch.zeros_like(x_in)
 
             for model_stat in model_stats:
-                for _ in range(scheduler.cutn_batches):
-                    if not model_stat['schedules'][num_step]:
-                        continue
+                if not model_stat['schedules'][num_step]:
+                    continue
 
+                for _ in range(scheduler.cutn_batches):
                     cuts = MakeCutoutsDango(
                         model_stat['input_resolution'],
                         Overview=scheduler.cut_overview,
@@ -126,13 +125,12 @@ def do_run(args, models, device) -> 'DocumentArray':
                     )
                     clip_in = normalize(cuts(x_in.add(1).div(2)))
                     image_embeds = (
-                        model_stat['clip_model'].encode_image(clip_in).float()
+                        model_stat['clip_model'].encode_image(clip_in).unsqueeze(1)
                     )
                     dists = spherical_dist_loss(
-                        image_embeds.unsqueeze(1),
-                        model_stat['target_embeds'].unsqueeze(0),
-                    )
-                    dists = dists.view(
+                        image_embeds,
+                        model_stat['target_embeds'],
+                    ).view(
                         [
                             scheduler.cut_overview + scheduler.cut_innercut,
                             n,
@@ -140,9 +138,7 @@ def do_run(args, models, device) -> 'DocumentArray':
                         ]
                     )
                     losses = dists.mul(model_stat['weights']).sum(2).mean(0)
-                    loss_values.append(
-                        losses.sum().item()
-                    )  # log loss, probably shouldn't do per cutn_batch
+
                     x_in_grad += (
                         torch.autograd.grad(
                             losses.sum() * scheduler.clip_guidance_scale, x_in
@@ -162,7 +158,10 @@ def do_run(args, models, device) -> 'DocumentArray':
             )
             if init is not None and scheduler.init_scale:
                 init_losses = lpips_model(x_in, init)
-                loss = loss + init_losses.sum() * scheduler.init_scale
+                loss += init_losses.sum() * scheduler.init_scale
+
+            loss_values.append(loss.item())
+
             x_in_grad += torch.autograd.grad(loss, x_in)[0]
             if not torch.isnan(x_in_grad).any():
                 grad = -torch.autograd.grad(x_in, x, x_in_grad)[0]
@@ -181,7 +180,7 @@ def do_run(args, models, device) -> 'DocumentArray':
     else:
         sample_fn = diffusion.plms_sample_loop_progressive
 
-    logger.info('creating artwork...')
+    logger.info('creating artworks...')
 
     image_display = _output_fn()
     is_busy_evs = [threading.Event(), threading.Event()]
@@ -254,14 +253,24 @@ def do_run(args, models, device) -> 'DocumentArray':
                 if j % args.display_rate == 0 or cur_t == -1:
                     for image in sample['pred_xstart']:
                         image = TF.to_pil_image(image.add(1).div(2).clamp(0, 1))
-                        c = Document(tags={'_status': {'cur_t': cur_t, 'step': j}})
+                        c = Document(
+                            tags={
+                                '_status': {
+                                    'cur_t': cur_t,
+                                    'step': j,
+                                    'loss': loss_values[-1],
+                                }
+                            }
+                        )
                         c.load_pil_image_to_datauri(image)
                         document.chunks.append(c)
-                        _dp1.clear_output(wait=True)
+                        image_display.clear_output(wait=True)
                         _dp1.display(image)
-                        c.save_uri_to_file(f'{output_dir}/{num_batch}-step-{j}.png')
+                        c.save_uri_to_file(
+                            os.path.join(output_dir, f'{num_batch}-step-{j}.png')
+                        )
                         document.chunks.plot_image_sprites(
-                            f'{output_dir}/{num_batch}-progress.png',
+                            os.path.join(output_dir, f'{num_batch}-progress.png'),
                             skip_empty=True,
                             show_index=True,
                             keep_aspect_ratio=True,
@@ -273,9 +282,10 @@ def do_run(args, models, device) -> 'DocumentArray':
                         'completed': cur_t == -1,
                         'cur_t': cur_t,
                         'step': j,
+                        'loss': loss_values,
                     }
                     if cur_t == -1:
-                        document.save_uri_to_file(f'{output_dir}/{num_batch}-done.png')
+                        document.save_uri_to_file(os.path.join(output_dir, f'{num_batch}-done.png'))
                     _start_persist(
                         threads,
                         da_batches,
@@ -334,7 +344,9 @@ def prepare_clip_models(args, clip_models, device, model_stats, txt_weights):
             raise ValueError(
                 f'The sum of all weights in the prompts must *not* be 0 but sum({model_stat["weights"]})={sum_weight}'
             )
-        model_stat['target_embeds'] = torch.cat(model_stat['target_embeds'])
+        model_stat['target_embeds'] = torch.cat(model_stat['target_embeds']).unsqueeze(
+            0
+        )
         model_stat['weights'] = torch.tensor(model_stat['weights'], device=device)
         model_stat['weights'] /= sum_weight
         model_stats.append(model_stat)
