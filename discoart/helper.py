@@ -1,6 +1,7 @@
 import gc
 import hashlib
 import logging
+import math
 import os
 import urllib.parse
 import urllib.request
@@ -509,3 +510,52 @@ More usage such as plotting, post-analysis can be found in the [README](https://
 def list_diffusion_models():
     for k in models_list.keys():
         print(k)
+
+def get_resampling_mode():
+    try:
+        from PIL import __version__, Image
+        major_ver = int(__version__.split('.')[0])
+        if major_ver >= 9:
+            return Image.Resampling.LANCZOS
+        else:
+            return Image.LANCZOS
+    except Exception as ex:
+        return 1  # 'Lanczos' irrespective of version.
+
+# Slices an image into the configured number of chunks. Overlap is currently 64px but should become dynamic
+def slice(source, gobig_horizontal, gobig_vertical, slices_todo):
+    width, height = source.size
+    overlap = 64 #int(height / slices_todo / 4)
+    if gobig_horizontal == True:
+        slice_height = int(height / slices_todo)
+        slice_height = 64 * math.floor(slice_height / 64) #round slice height down to the nearest 64
+        slice_height += overlap
+        i = 0
+        slices = []
+        x = 0
+        y = 0
+        bottomy = slice_height
+        while i < slices_todo:
+            slices.append(source.crop((x, y, width, bottomy)))
+            y += slice_height - overlap
+            bottomy = y + slice_height
+            i += 1
+    if gobig_vertical == True:
+        slice_width = int(width / slices_todo)
+        slice_width = 64 * math.floor(slice_width / 64) #round slice width down to the nearest 64
+        remainder = width - (slice_width * slices_todo)
+        while remainder > 0:
+            slices_todo += 1
+            remainder = remainder - slice_width
+        slice_width += overlap
+        i = 0
+        slices = []
+        x = 0
+        y = 0
+        edgex = slice_width
+        while i < slices_todo:
+            slices.append(source.crop((x, y, edgex, height)))
+            x += slice_width - overlap
+            edgex = x + slice_width
+            i += 1
+    return (slices)

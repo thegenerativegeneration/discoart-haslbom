@@ -16,9 +16,11 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 from docarray import DocumentArray, Document
 from rich.text import Text
+from torch import Tensor
 
+from . import helper
 from .config import print_args_table
-from .helper import logger, PromptParser, get_ipython_funcs
+from .helper import logger, PromptParser, get_ipython_funcs, get_resampling_mode
 from .nn.losses import spherical_dist_loss, tv_loss, range_loss
 from .nn.make_cutouts import MakeCutoutsDango
 from .nn.sec_diff import alpha_sigma_to_t
@@ -187,120 +189,143 @@ def do_run(args, models, device) -> 'DocumentArray':
 
     da_batches = DocumentArray()
 
+    letsgobig = True
     org_seed = args.seed
     for num_batch in range(args.n_batches):
 
-        # set seed for each image in the batch
-        new_seed = org_seed + num_batch
-        _set_seed(new_seed)
-        args.seed = new_seed
-        pgbar = '▰' * (num_batch + 1) + '▱' * (args.n_batches - num_batch - 1)
+        if letsgobig:
+            gobig_scale = 2
 
-        _dp1.display(
-            Text(f'n_batches={args.n_batches}: {pgbar}'),
-            print_args_table(vars(args), only_non_default=True, console_print=False),
-            image_display,
-        )
-        gc.collect()
-        torch.cuda.empty_cache()
+            slices_todo = (gobig_scale * gobig_scale) + 1  # we want 5 total slices for a 2x increase, 4 to match the total pixel increase + 1 to cover overlap
 
-        document = Document(tags=copy.deepcopy(vars(args)))
-        da_batches.append(document)
+            reside_x = side_x * gobig_scale
+            reside_y = side_y * gobig_scale
 
-        cur_t = diffusion.num_timesteps - skip_steps - 1
 
-        if args.perlin_init:
-            from discoart.nn.perlin_noises import regen_perlin
-            init = regen_perlin(
-                args.perlin_mode, side_y, side_x, device, args.batch_size
-            )
+            source_image = init.resize((reside_x, reside_y), get_resampling_mode())
 
-        if args.diffusion_sampling_mode == 'ddim':
-            samples = sample_fn(
-                model,
-                (args.batch_size, 3, side_y, side_x),
-                clip_denoised=args.clip_denoised,
-                model_kwargs={},
-                cond_fn=cond_fn,
-                progress=True,
-                skip_timesteps=skip_steps,
-                init_image=init,
-                randomize_class=args.randomize_class,
-                eta=args.eta,
-                transformation_fn=lambda x: symmetry_transformation_fn(
-                    x, args.use_horizontal_symmetry, args.use_vertical_symmetry
-                ),
-                transformation_percent=args.transformation_percent,
-            )
+            slices = helper.slice(source_image, True, False, slices_todo)
+
+            for chunk in slices:
+
+                side_x, side_y = chunk.size
+                do_normal_batch(_dp1, args, cond_fn, da_batches, device, diffusion, image_display, chunk, is_busy_evs,
+                                loss_values, model, num_batch, org_seed, output_dir, sample_fn, side_x, side_y,
+                                skip_steps)
+
         else:
-            samples = sample_fn(
-                model,
-                (args.batch_size, 3, side_y, side_x),
-                clip_denoised=args.clip_denoised,
-                model_kwargs={},
-                cond_fn=cond_fn,
-                progress=True,
-                skip_timesteps=skip_steps,
-                init_image=init,
-                randomize_class=args.randomize_class,
-                order=2,
-            )
-
-        threads = []
-        for j, sample in enumerate(samples):
-            cur_t -= 1
-            with image_display:
-                if j % args.display_rate == 0 or cur_t == -1:
-                    for image in sample['pred_xstart']:
-                        image = TF.to_pil_image(image.add(1).div(2).clamp(0, 1))
-                        c = Document(
-                            tags={
-                                '_status': {
-                                    'cur_t': cur_t,
-                                    'step': j,
-                                    'loss': loss_values[-1],
-                                }
-                            }
-                        )
-                        c.load_pil_image_to_datauri(image)
-                        document.chunks.append(c)
-                        image_display.clear_output(wait=True)
-                        _dp1.display(image)
-                        c.save_uri_to_file(
-                            os.path.join(output_dir, f'{num_batch}-step-{j}.png')
-                        )
-                        document.chunks.plot_image_sprites(
-                            os.path.join(output_dir, f'{num_batch}-progress.png'),
-                            skip_empty=True,
-                            show_index=True,
-                            keep_aspect_ratio=True,
-                        )
-
-                    # root doc always update with the latest progress
-                    document.uri = c.uri
-                    document.tags['_status'] = {
-                        'completed': cur_t == -1,
-                        'cur_t': cur_t,
-                        'step': j,
-                        'loss': loss_values,
-                    }
-                    if cur_t == -1:
-                        document.save_uri_to_file(os.path.join(output_dir, f'{num_batch}-done.png'))
-                    _start_persist(
-                        threads,
-                        da_batches,
-                        args.name_docarray,
-                        is_busy_evs,
-                        force=cur_t == -1,
-                    )
-
-        for t in threads:
-            t.join()
-        _dp1.clear_output(wait=True)
+            do_normal_batch(_dp1, args, cond_fn, da_batches, device, diffusion, image_display, init, is_busy_evs,
+                            loss_values, model, num_batch, org_seed, output_dir, sample_fn, side_x, side_y, skip_steps)
 
     logger.info(f'done! {args.name_docarray}')
 
     return da_batches
+
+
+
+
+def do_normal_batch(_dp1, args, cond_fn, da_batches, device, diffusion, image_display, init, is_busy_evs, loss_values,
+                    model, num_batch, org_seed, output_dir, sample_fn, side_x, side_y, skip_steps):
+    # set seed for each image in the batch
+    new_seed = org_seed + num_batch
+    _set_seed(new_seed)
+    args.seed = new_seed
+    pgbar = '▰' * (num_batch + 1) + '▱' * (args.n_batches - num_batch - 1)
+    _dp1.display(
+        Text(f'n_batches={args.n_batches}: {pgbar}'),
+        print_args_table(vars(args), only_non_default=True, console_print=False),
+        image_display,
+    )
+    gc.collect()
+    torch.cuda.empty_cache()
+    document = Document(tags=copy.deepcopy(vars(args)))
+    da_batches.append(document)
+    cur_t = diffusion.num_timesteps - skip_steps - 1
+    if args.perlin_init:
+        from discoart.nn.perlin_noises import regen_perlin
+        init = regen_perlin(
+            args.perlin_mode, side_y, side_x, device, args.batch_size
+        )
+    if args.diffusion_sampling_mode == 'ddim':
+        samples = sample_fn(
+            model,
+            (args.batch_size, 3, side_y, side_x),
+            clip_denoised=args.clip_denoised,
+            model_kwargs={},
+            cond_fn=cond_fn,
+            progress=True,
+            skip_timesteps=skip_steps,
+            init_image=init,
+            randomize_class=args.randomize_class,
+            eta=args.eta,
+            transformation_fn=lambda x: symmetry_transformation_fn(
+                x, args.use_horizontal_symmetry, args.use_vertical_symmetry
+            ),
+            transformation_percent=args.transformation_percent,
+        )
+    else:
+        samples = sample_fn(
+            model,
+            (args.batch_size, 3, side_y, side_x),
+            clip_denoised=args.clip_denoised,
+            model_kwargs={},
+            cond_fn=cond_fn,
+            progress=True,
+            skip_timesteps=skip_steps,
+            init_image=init,
+            randomize_class=args.randomize_class,
+            order=2,
+        )
+    threads = []
+    for j, sample in enumerate(samples):
+        cur_t -= 1
+        with image_display:
+            if j % args.display_rate == 0 or cur_t == -1:
+                for image in sample['pred_xstart']:
+                    image = TF.to_pil_image(image.add(1).div(2).clamp(0, 1))
+                    c = Document(
+                        tags={
+                            '_status': {
+                                'cur_t': cur_t,
+                                'step': j,
+                                'loss': loss_values[-1],
+                            }
+                        }
+                    )
+                    c.load_pil_image_to_datauri(image)
+                    document.chunks.append(c)
+                    image_display.clear_output(wait=True)
+                    _dp1.display(image)
+                    c.save_uri_to_file(
+                        os.path.join(output_dir, f'{num_batch}-step-{j}.png')
+                    )
+                    document.chunks.plot_image_sprites(
+                        os.path.join(output_dir, f'{num_batch}-progress.png'),
+                        skip_empty=True,
+                        show_index=True,
+                        keep_aspect_ratio=True,
+                    )
+
+                # root doc always update with the latest progress
+                document.uri = c.uri
+                document.tags['_status'] = {
+                    'completed': cur_t == -1,
+                    'cur_t': cur_t,
+                    'step': j,
+                    'loss': loss_values,
+                }
+                if cur_t == -1:
+                    document.save_uri_to_file(os.path.join(output_dir, f'{num_batch}-done.png'))
+                _start_persist(
+                    threads,
+                    da_batches,
+                    args.name_docarray,
+                    is_busy_evs,
+                    force=cur_t == -1,
+                )
+    for t in threads:
+        t.join()
+    _dp1.clear_output(wait=True)
 
 
 def prepare_clip_models(args, clip_models, device, model_stats, txt_weights):
@@ -352,7 +377,7 @@ def prepare_clip_models(args, clip_models, device, model_stats, txt_weights):
         model_stats.append(model_stat)
 
 
-def create_perlin_init(args, device, side_x, side_y):
+def create_perlin_init(args, device, side_x, side_y) -> Tensor:
     from .nn.perlin_noises import create_perlin_noise
 
     if args.perlin_mode == 'color':
