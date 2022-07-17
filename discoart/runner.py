@@ -193,6 +193,8 @@ def do_run(args, models, device) -> 'DocumentArray':
     org_seed = args.seed
     for num_batch in range(args.n_batches):
 
+        logger.error("GOBIG")
+
         if letsgobig:
             gobig_scale = 2
 
