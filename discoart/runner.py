@@ -209,6 +209,7 @@ def do_run(args, models, device) -> 'DocumentArray':
             for chunk in slices:
 
                 side_x, side_y = chunk.size
+                skip_steps = int(diffusion.num_timesteps * .6)
                 do_normal_batch(_dp1, args, cond_fn, da_batches, device, diffusion, image_display, chunk, is_busy_evs,
                                 loss_values, model, num_batch, org_seed, output_dir, sample_fn, side_x, side_y,
                                 skip_steps)
