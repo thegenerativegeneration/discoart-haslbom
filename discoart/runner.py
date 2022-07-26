@@ -3,7 +3,6 @@ import os
 import random
 import threading
 from pathlib import Path
-from threading import Thread
 from types import SimpleNamespace
 from typing import List, Dict
 
@@ -21,6 +20,7 @@ from .nn.losses import spherical_dist_loss, tv_loss, range_loss
 from .nn.make_cutouts import MakeCutoutsDango
 from .nn.sec_diff import alpha_sigma_to_t
 from .nn.transform import symmetry_transformation_fn
+from .persist import _sample_thread, _persist_thread, _save_progress_thread
 
 _MAX_DIFFUSION_STEPS = 1000
 
@@ -93,7 +93,11 @@ def do_run(args, models, device, events) -> 'DocumentArray':
         }
 
         for txt, weight in txt_weights:
-            txt = clip_model.encode_text(clip.tokenize(txt).to(text_device))
+            txt = clip_model.encode_text(
+                clip.tokenize(txt, truncate=args.truncate_overlength_prompt).to(
+                    text_device
+                )
+            )
 
             if args.fuzzy_prompt:
                 for _ in range(25):
@@ -186,9 +190,8 @@ def do_run(args, models, device, events) -> 'DocumentArray':
         scheduler = _get_current_schedule(schedule_table, num_step)
 
         with torch.enable_grad():
-            x_is_NaN = False
+
             x = x.detach().requires_grad_()
-            n = x.shape[0]
             if scheduler.use_secondary_model:
                 alpha = torch.tensor(
                     diffusion.sqrt_alphas_cumprod[cur_t],
@@ -201,16 +204,29 @@ def do_run(args, models, device, events) -> 'DocumentArray':
                     dtype=torch.float32,
                 )
                 cosine_t = alpha_sigma_to_t(alpha, sigma)
-                out = secondary_model(x, cosine_t[None].repeat([n])).pred
-                fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
-                x_in = out * fac + x * (1 - fac)
-                x_in_grad = torch.zeros_like(x_in)
+                out = secondary_model(x, cosine_t[None].repeat([x.shape[0]])).pred
             else:
-                my_t = torch.ones([n], device=device, dtype=torch.long) * cur_t
-                out = diffusion.p_mean_variance(model, x, my_t, clip_denoised=False)
-                fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
-                x_in = out['pred_xstart'] * fac + x * (1 - fac)
-                x_in_grad = torch.zeros_like(x_in)
+                my_t = torch.ones([x.shape[0]], device=device, dtype=torch.long) * cur_t
+                out = diffusion.p_mean_variance(model, x, my_t, clip_denoised=False)[
+                    'pred_xstart'
+                ]
+
+            fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
+            x_in = out * fac + x * (1 - fac)
+
+            tv_losses = tv_loss(x_in)
+            range_losses = range_loss(out)
+            sat_losses = torch.abs(x_in - x_in.clamp(min=-1, max=1)).mean()
+            loss = (
+                tv_losses.sum() * scheduler.tv_scale
+                + range_losses.sum() * scheduler.range_scale
+                + sat_losses.sum() * scheduler.sat_scale
+            )
+            if init is not None and scheduler.init_scale:
+                init_losses = lpips_model(x_in, init)
+                loss += init_losses.sum() * scheduler.init_scale
+
+            x_in_grad = torch.autograd.grad(loss, x_in)[0]
 
             for model_stat in model_stats:
 
@@ -240,41 +256,33 @@ def do_run(args, models, device, events) -> 'DocumentArray':
                     dists = dists.view(
                         [
                             scheduler.cut_overview + scheduler.cut_innercut,
-                            n,
+                            x.shape[0],
                             -1,
                         ]
                     )
-                    losses = dists.mul(model_stat['prompt_weights']).sum(2).mean(0)
-
-                    x_in_grad += (
-                        torch.autograd.grad(
-                            losses.sum() * scheduler.clip_guidance_scale, x_in
-                        )[0]
-                        / scheduler.cutn_batches
+                    cut_loss = (
+                        dists.mul(model_stat['prompt_weights']).sum(2).mean(0).sum()
                     )
-            tv_losses = tv_loss(x_in)
-            if scheduler.use_secondary_model:
-                range_losses = range_loss(out)
-            else:
-                range_losses = range_loss(out['pred_xstart'])
-            sat_losses = torch.abs(x_in - x_in.clamp(min=-1, max=1)).mean()
-            loss = (
-                tv_losses.sum() * scheduler.tv_scale
-                + range_losses.sum() * scheduler.range_scale
-                + sat_losses.sum() * scheduler.sat_scale
+
+                    x_in_grad += torch.autograd.grad(
+                        cut_loss
+                        * scheduler.clip_guidance_scale
+                        / scheduler.cutn_batches,
+                        x_in,
+                    )[0]
+
+        x_is_NaN = False
+        if not torch.isnan(x_in_grad).any():
+            grad = -torch.autograd.grad(x_in, x, x_in_grad)[0]
+        else:
+            x_is_NaN = True
+            grad = torch.zeros_like(x)
+            logger.warning(
+                f'NaN detected in grad at step {num_step}, if this message continues to show up, then your image is not updated and further steps are unnecessary.'
             )
-            if init is not None and scheduler.init_scale:
-                init_losses = lpips_model(x_in, init)
-                loss += init_losses.sum() * scheduler.init_scale
 
-            loss_values.append(loss.item())
+        loss_values.append(loss.detach().item())
 
-            x_in_grad += torch.autograd.grad(loss, x_in)[0]
-            if not torch.isnan(x_in_grad).any():
-                grad = -torch.autograd.grad(x_in, x, x_in_grad)[0]
-            else:
-                x_is_NaN = True
-                grad = torch.zeros_like(x)
         if scheduler.clamp_grad and not x_is_NaN:
             magnitude = grad.square().mean().sqrt()
             return (
@@ -312,6 +320,7 @@ def do_run(args, models, device, events) -> 'DocumentArray':
         free_memory()
 
         d = Document(tags=copy.deepcopy(vars(args)))
+        _d_gif = Document()
         da_batches.append(d)
 
         cur_t = diffusion.num_timesteps - skip_steps - 1
@@ -363,11 +372,12 @@ def do_run(args, models, device, events) -> 'DocumentArray':
 
             is_save_step = j % (args.display_rate or args.save_rate) == 0 or cur_t == -1
             threads.append(
-                _plot_thread(
+                _sample_thread(
                     sample,
                     _nb,
                     cur_t,
                     d,
+                    _d_gif,
                     image_display,
                     j,
                     loss_values,
@@ -378,6 +388,11 @@ def do_run(args, models, device, events) -> 'DocumentArray':
             )
 
             if is_save_step:
+                threads.append(
+                    _save_progress_thread(
+                        d, _d_gif, _nb, output_dir, args.gif_fps, args.gif_size_ratio
+                    )
+                )
                 threads.extend(
                     _persist_thread(
                         da_batches,
@@ -402,149 +417,12 @@ def do_run(args, models, device, events) -> 'DocumentArray':
     return da_batches
 
 
-def _plot_thread(*args):
-    t = Thread(
-        target=_plot_sample,
-        args=(*args,),
-    )
-    t.start()
-    return t
-
-
-def _plot_sample(
-    sample,
-    _nb,
-    cur_t,
-    d,
-    image_display,
-    j,
-    loss_values,
-    output_dir,
-    is_sampling_done,
-    is_save_step,
-):
-    with threading.Lock():
-        is_sampling_done.clear()
-        _display_html = []
-
-        for k, image in enumerate(sample['pred_xstart']):  # batch_size
-            image = TF.to_pil_image(image.add(1).div(2).clamp(0, 1))
-
-            if is_save_step:
-                c = Document(
-                    tags={
-                        '_status': {
-                            'cur_t': cur_t,
-                            'step': j,
-                            'loss': loss_values[-1],
-                            'minibatch_idx': k,
-                        }
-                    }
-                )
-                c.load_pil_image_to_datauri(image)
-
-                if cur_t == -1:
-                    c.save_uri_to_file(os.path.join(output_dir, f'{_nb}-done-{k}.png'))
-                else:
-                    c.save_uri_to_file(
-                        os.path.join(output_dir, f'{_nb}-step-{j}-{k}.png')
-                    )
-
-                d.chunks.append(c)
-                # root doc always update with the latest progress
-                d.uri = c.uri
-            else:
-                c = Document().load_pil_image_to_datauri(image)
-
-            _display_html.append(f'<img src="{c.uri}" alt="step {j} minibatch {k}">')
-
-        image_display.value = '<br>\n'.join(_display_html)
-
-        if is_save_step:
-            try:
-                # only print the first image of the minibatch in progress
-                d.chunks.plot_image_sprites(
-                    os.path.join(output_dir, f'{_nb}-progress.png'),
-                    skip_empty=True,
-                    show_index=True,
-                    keep_aspect_ratio=True,
-                )
-            except ValueError:
-                logger.debug('can not plot progress into sprite image')
-            d.tags['_status'] = {
-                'completed': cur_t == -1,
-                'cur_t': cur_t,
-                'step': j,
-                'loss': loss_values,
-            }
-        logger.debug('sample and plot is done')
-        is_sampling_done.set()
-
-
-def _persist_thread(
-    da_batches, name_docarray, is_busy_evs, is_sampling_done, is_completed
-):
-    for fn, idle_ev in zip((_silent_save, _silent_push), is_busy_evs):
-        t = Thread(
-            target=fn,
-            args=(da_batches, name_docarray, idle_ev, is_sampling_done, is_completed),
-        )
-        t.start()
-        yield t
-
-
 def _set_seed(seed: int) -> None:
     np.random.seed(seed)
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-
-
-def _silent_save(
-    da_batches: DocumentArray,
-    name: str,
-    is_busy_event: threading.Event,
-    is_sampling_done: threading.Event,
-    force: bool = False,
-) -> None:
-    if is_busy_event.is_set() and not force:
-        logger.debug(f'another save is running, skipping')
-        return
-    is_sampling_done.wait()
-    is_busy_event.set()
-    try:
-        pb_path = os.path.join(
-            os.environ.get('DISCOART_OUTPUT_DIR', './'), f'{name}.protobuf.lz4'
-        )
-        da_batches.save_binary(pb_path)
-        logger.debug(f'local backup to {pb_path}')
-    except Exception as ex:
-        logger.debug(f'local backup failed: {ex}')
-    is_busy_event.clear()
-
-
-def _silent_push(
-    da_batches: DocumentArray,
-    name: str,
-    is_busy_event: threading.Event,
-    is_sampling_done: threading.Event,
-    force: bool = False,
-) -> None:
-    if 'DISCOART_OPTOUT_CLOUD_BACKUP' in os.environ:
-        return
-    if is_busy_event.is_set() and not force:
-        logger.debug(f'another cloud backup is running, skipping')
-        return
-    is_sampling_done.wait()
-    is_busy_event.set()
-
-    try:
-        da_batches.push(name)
-        logger.debug(f'cloud backup to {name}')
-    except Exception as ex:
-        logger.debug(f'cloud backup failed: {ex}')
-    is_busy_event.clear()
 
 
 def _eval_scheduling_str(val) -> List[float]:

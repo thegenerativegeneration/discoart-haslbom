@@ -34,9 +34,9 @@ Disco Diffusion is a Google Colab Notebook that leverages CLIP-Guided Diffusion 
 Do you see the `discoart-id` in each tweet? To get the config & prompts, simply:
 
 ```python
-from docarray import DocumentArray
+from discoart import show_config
 
-da = DocumentArray.pull('discoart-id')
+show_config('discoart-id')
 ```
 
 ## Install
@@ -101,9 +101,10 @@ The difference on the parameters between DiscoArt and DD5.6 [is explained here](
 
 Final results and intermediate results are created under the current working directory, e.g.
 ```text
+./{name-docarray}/{i}-done.png
 ./{name-docarray}/{i}-step-{j}.png
 ./{name-docarray}/{i}-progress.png
-./{name-docarray}/{i}-done.png
+./{name-docarray}/{i}-progress.gif
 ```
 
 ![](.github/result-persist.png)
@@ -114,8 +115,10 @@ where:
 - `i-*` is up to the value of `n_batches`.
 - `*-done-*` is the final image on done.
 - `*-step-*` is the intermediate image at certain step.
-- `*-progress-*` is the sprite image of all intermediate results so far.
+- `*-progress.png` is the sprite image of all intermediate results so far.
+- `*-progress.gif` is the animated gif of all intermediate results so far.
 
+The save frequency is controlled by `save_rate`.
 
 Moreover, `create()` returns `da`, a [DocumentArray](https://docarray.jina.ai/fundamentals/documentarray/)-type object. It contains the following information:
 - All arguments passed to `create()` function, including seed, text prompts and model parameters.
@@ -179,6 +182,8 @@ da[0].chunks.save_gif(
 
 ![](.github/lighthouse.gif)
 
+Note that >=0.7.14, a 20FPS gif is generated which includes all intermedidate steps. 
+
 ### Export configs
 
 You can review its parameters from `da[0].tags` or export it as an SVG image:
@@ -225,6 +230,15 @@ create(
 )
 ```
 
+If you just want to initialize from a known DocArray ID, then simply:
+
+```python
+from discoart import create
+
+create(init_document='discoart-3205998582')
+```
+
+
 
 ### Environment variables
 
@@ -241,6 +255,7 @@ DISCOART_MODELS_YAML='path/to/your-models.yml' # use a custom list of models fil
 DISCOART_OUTPUT_DIR='path/to/your-output-dir' # use a custom output directory for all images and results
 DISCOART_CACHE_DIR='path/to/your-cache-dir' # use a custom cache directory for models and downloads
 DISCOART_DISABLE_REMOTE_MODELS='1' # disable the listing of diffusion models on Github, remote diffusion models allows user to use latest models without updating the codebase.
+DISCOART_REMOTE_MODELS_URL='https://yourdomain/models.yml' # use a custom remote URL for fetching models list
 ```
 
 ## CLI
@@ -444,7 +459,7 @@ c = Client(host='grpc://0.0.0.0:51001')
 
 da = c.post(
     '/create',
-    parameter={
+    parameters={
         'name_docarray': 'mydisco-123',
         'text_prompts': [
             'A beautiful painting of a singular lighthouse',
@@ -454,7 +469,7 @@ da = c.post(
 )
 
 # check intermediate results
-da = c.post('/result', parameter={'name_docarray': 'mydisco-123'})
+da = c.post('/result', parameters={'name_docarray': 'mydisco-123'})
 ```
 
 ### Hosting on Google Colab

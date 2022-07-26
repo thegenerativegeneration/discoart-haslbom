@@ -1,7 +1,9 @@
 import gc
 import hashlib
+import json
 import logging
 import os
+import sys
 import threading
 import urllib.parse
 import urllib.request
@@ -11,10 +13,13 @@ from pathlib import Path
 from typing import Dict, Any, List, Tuple
 from urllib.request import Request, urlopen
 
+import pkg_resources
 import regex as re
 import torch
 import yaml
 from clip.simple_tokenizer import SimpleTokenizer, whitespace_clean, basic_clean
+from packaging.version import Version
+
 from spellchecker import SpellChecker
 from tqdm.auto import tqdm
 
@@ -57,22 +62,29 @@ models_list = get_model_list()
 
 
 def get_remote_model_list(local_model_list: Dict[str, Any], force_print: bool = False):
-    if 'DISCOART_DISABLE_REMOTE_MODELS' not in os.environ:
-        try:
-            req = Request(
-                f'https://raw.githubusercontent.com/jina-ai/discoart/main/discoart/resources/models.yml',
-                headers={'User-Agent': 'Mozilla/5.0'},
-            )
-            with urlopen(
-                req, timeout=2
-            ) as resp:  # 'with' is important to close the resource after use
-                remote_model_list = yaml.load(resp, Loader=Loader)
-        except Exception as ex:
-            logger.error(f'can not fetch the latest `model_list` from remote, {ex}')
+    if 'DISCOART_DISABLE_REMOTE_MODELS' in os.environ:
+        return
+
+    try:
+        req = Request(
+            os.environ.get(
+                'DISCOART_REMOTE_MODELS_URL',
+                'https://raw.githubusercontent.com/jina-ai/discoart/main/discoart/resources/models.yml',
+            ),
+            headers={'User-Agent': 'Mozilla/5.0'},
+        )
+        with urlopen(
+            req, timeout=2
+        ) as resp:  # 'with' is important to close the resource after use
+            remote_model_list = yaml.load(resp, Loader=Loader)
+    except Exception as ex:
+        logger.error(f'can not fetch the latest `model_list` from remote, {ex}')
 
     if (remote_model_list and remote_model_list != local_model_list) or force_print:
         if not force_print:
-            logger.warning('remote model list is different from the local model list')
+            logger.warning(
+                'remote model list is different from the local model list, override local list.'
+            )
 
         from rich.table import Table
         from rich import box, print
@@ -276,7 +288,7 @@ def _get_sha(path):
 
 def _get_model_name(name: str) -> str:
     for k in models_list.keys():
-        if k.startswith(name):
+        if k.lower().startswith(name.lower().strip()):
             return k
 
 
@@ -407,7 +419,7 @@ def load_diffusion_model(user_args, device):
     elif _diff_model_name:
         model_filename = os.path.basename(models_list[_diff_model_name]['sources'][0])
         _model_path = os.path.join(cache_dir, model_filename)
-    model.load_state_dict(torch.load(_model_path, map_location='cpu'))
+    model.load_state_dict(torch.load(_model_path, map_location='cpu'), strict=False)
     model.requires_grad_(False).eval().to(device)
 
     for name, param in model.named_parameters():
@@ -549,18 +561,19 @@ To save the full-size images, please check out the instruction in the next secti
 
 Final results and intermediate results are created under the current working directory, e.g.
 ```text
-./{_name}/[i]-step-[i].png
-./{_name}/[i]-progress.png
 ./{_name}/[i]-done.png
+./{_name}/[i]-step-[i].png
+./{_name}/[i]-progress.gif
+./{_name}/[i]-progress.png
 ```
 
 where:
 
-- `name-docarray` is the name of the run, you can specify it otherwise it is a random name.
 - `i-*` is up to the value of `n_batches`.
 - `*-done-*` is the final image on done.
 - `*-step-*` is the intermediate image at certain step.
-- `*-progress-*` is the sprite image of all intermediate results so far.
+- `*-progress.png` is the sprite image of all intermediate results so far.
+- `*-progress.gif` is the animated gif of all intermediate results so far.
 
 
 # 💾 Save & load the batch        
@@ -595,3 +608,43 @@ More usage such as plotting, post-analysis can be found in the [README](https://
 
 def list_diffusion_models():
     get_remote_model_list(models_list, force_print=True)
+
+
+def _version_check(package: str = None, github_repo: str = None):
+    try:
+        if not package:
+            package = vars(sys.modules[__name__])['__package__']
+        if not github_repo:
+            github_repo = package
+
+        cur_ver = Version(pkg_resources.get_distribution(package).version)
+        req = Request(
+            f'https://pypi.python.org/pypi/{package}/json',
+            headers={'User-Agent': 'Mozilla/5.0'},
+        )
+        with urlopen(
+            req, timeout=1
+        ) as resp:  # 'with' is important to close the resource after use
+            j = json.load(resp)
+            releases = j.get('releases', {})
+            latest_release_ver = max(
+                Version(v) for v in releases.keys() if '.dev' not in v
+            )
+            if cur_ver < latest_release_ver:
+                from rich import print
+                from rich.panel import Panel
+
+                print(
+                    Panel(
+                        f'You are using [b]{package} {cur_ver}[/b], but [bold green]{latest_release_ver}[/] is available. '
+                        f'You may upgrade it via [b]pip install -U {package}[/b]. [link=https://github.com/jina-ai/{github_repo}/releases]Read Changelog here[/link].',
+                        title=':new: New version available!',
+                        width=50,
+                    )
+                )
+    except Exception as ex:
+        # no network, too slow, PyPi is down
+        logger.error(f'can not fetch the lastest version number: {ex}')
+
+
+threading.Thread(target=_version_check, args=(__package__, 'discoart')).start()
