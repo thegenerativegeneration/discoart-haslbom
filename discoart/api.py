@@ -1,10 +1,9 @@
 import os
-from typing import Dict
 
 os.environ['DISCOART_DISABLE_IPYTHON'] = '1'  # turn on when using from CLI
 
-from yaml import Loader
 import yaml
+from yaml import Loader
 from . import __resources_path__
 
 

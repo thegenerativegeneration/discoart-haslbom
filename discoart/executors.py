@@ -10,14 +10,19 @@ class DiscoArtExecutor(Executor):
     stop_event = asyncio.Event()
 
     @requests(on='/create')
-    async def create_artworks(self, parameters: Dict, **kwargs):
-        await asyncio.get_event_loop().run_in_executor(None, self._create, parameters)
+    async def create_artworks(self, docs: DocumentArray, parameters: Dict, **kwargs):
+        await asyncio.get_event_loop().run_in_executor(
+            None, self._create, docs, parameters
+        )
 
-    def _create(self, parameters: Dict, **kwargs):
+    def _create(self, docs: DocumentArray, parameters: Dict, **kwargs):
         from .create import create
 
         return create(
-            skip_event=self.skip_event, stop_event=self.stop_event, **parameters
+            init_document=docs,
+            skip_event=self.skip_event,
+            stop_event=self.stop_event,
+            **parameters
         )
 
     @requests(on='/skip')
@@ -32,9 +37,11 @@ class DiscoArtExecutor(Executor):
 class ResultPoller(Executor):
     @requests(on='/result')
     def poll_results(self, parameters: Dict, **kwargs):
+        from discoart.helper import get_output_dir
+
         path = os.path.join(
-            os.environ.get('DISCOART_OUTPUT_DIR', './'),
-            f'{parameters["name_docarray"]}.protobuf.lz4',
+            get_output_dir(parameters['name_docarray']),
+            'da.protobuf.lz4',
         )
         if os.path.exists(path):
             return DocumentArray.load_binary(path)

@@ -1,8 +1,10 @@
+import copy
 import multiprocessing
 import os
 import warnings
 from types import SimpleNamespace
 from typing import overload, List, Optional, Dict, Any, Union, TYPE_CHECKING
+
 
 if TYPE_CHECKING:
     import threading
@@ -39,10 +41,9 @@ def create(
     diffusion_sampling_mode: Optional[str] = 'ddim',
     display_rate: Optional[int] = None,
     eta: Optional[float] = 0.8,
-    fuzzy_prompt: Optional[bool] = False,
     gif_fps: Optional[int] = 20,
     gif_size_ratio: Optional[float] = 0.5,
-    init_document: Optional['Document'] = None,
+    init_document: Optional[Union['Document', 'DocumentArray']] = None,
     init_image: Optional[str] = None,
     init_scale: Optional[Union[int, str]] = 1000,
     n_batches: Optional[int] = 4,
@@ -66,7 +67,7 @@ def create(
         Union['multiprocessing.Event', 'asyncio.Event', 'threading.Event']
     ] = None,
     text_clip_on_cpu: Optional[bool] = False,
-    text_prompts: Optional[List[str]] = [
+    text_prompts: Optional[Union[List[str], Dict[str, Any]]] = [
         'A beautiful painting of a singular lighthouse, shining its light across a tumultuous sea of blood by greg rutkowski and thomas kinkade, Trending on artstation.',
         'yellow color scheme',
     ],
@@ -114,14 +115,13 @@ def create(**kwargs) -> Optional['DocumentArray']:
     :param diffusion_sampling_mode: Two alternate diffusion denoising algorithms. ddim has been around longer, and is more established and tested.  plms is a newly added alternate method that promises good diffusion results in fewer steps, but has not been as fully tested and may have side effects. This new plms mode is actively being researched in the #settings-and-techniques channel in the DD Discord.
     :param display_rate: [DiscoArt] Display rate is deprecated in DiscoArt as it is always 1, meaning display is always in real-time. There is no need to worry on the speed as the rendering happens in another thread. To control the save rate, use the `save_rate` parameter.Setting this will override the `save_rate` parameter.
     :param eta: eta (greek letter η) is a diffusion model variable that mixes in a random amount of scaled noise into each timestep. 0 is no noise, 1.0 is more noise. As with most DD parameters, you can go below zero for eta, but it may give you unpredictable results. The steps parameter has a close relationship with the eta parameter. If you set eta to 0, then you can get decent output with only 50-75 steps. Setting eta to 1.0 favors higher step counts, ideally around 250 and up. eta has a subtle, unpredictable effect on image, so you’ll need to experiment to see how this affects your projects.
-    :param fuzzy_prompt: Controls whether to add multiple noisy prompts to the prompt losses. If True, can increase variability of image output. Experiment with this.
     :param gif_fps: [DiscoArt] The frame rate of the generated GIF.
     :param gif_size_ratio: [DiscoArt] The relative size vs. the original image, small size ratio gives smaller file size.
     :param init_document: [DiscoArt] Use a Document object as the initial state for DD: its ``.tags`` will be used as parameters, ``.uri`` (if present) will be used as init image.
     :param init_image: Recall that in the image sequence above, the first image shown is just noise.  If an init_image is provided, diffusion will replace the noise with the init_image as its starting state.  To use an init_image, upload the image to the Colab instance or your Google Drive, and enter the full image path here. If using an init_image, you may need to increase skip_steps to ~ 50% of total steps to retain the character of the init. See skip_steps above for further discussion.
     :param init_scale: This controls how strongly CLIP will try to match the init_image provided.  This is balanced against the clip_guidance_scale (CGS) above.  Too much init scale, and the image won’t change much during diffusion. Too much CGS and the init image will be lost.[DiscoArt] Can be scheduled via syntax `[val1]*400+[val2]*600`.
     :param n_batches: This variable sets the number of still images you want DD to create.  If you are using an animation mode (see below for details) DD will ignore n_batches and create a single set of animated frames based on the animation settings.
-    :param name_docarray: [DiscoArt] When specified, it overrides the default naming schema of the resulted DocumentArray. Useful when you have to know the result DocumentArray name in advance.
+    :param name_docarray: [DiscoArt] When specified, it overrides the default naming schema of the resulted DocumentArray. Useful when you have to know the result DocumentArray name in advance.The name also supports variable substitution via `{}`. For example, `name_docarray='test-{steps}-{perlin_init}'` will give the name of the DocumentArray as `test-250-False`. Any variable in the config can be substituted.
     :param on_misspelled_token: [DiscoArt] Strategy when encounter misspelled token, can be 'raise', 'correct' and 'ignore'. If 'raise', then the misspelled token in the prompt will raise a ValueError. If 'correct', then the token will be replaced with the correct token. If 'ignore', then the token will be ignored but a warning will show.
     :param perlin_init: Normally, DD will use an image filled with random noise as a starting point for the diffusion curve.  If perlin_init is selected, DD will instead use a Perlin noise model as an initial state.  Perlin has very interesting characteristics, distinct from random noise, so it’s worth experimenting with this for your projects. Beyond perlin, you can, of course, generate your own noise images (such as with GIMP, etc) and use them as an init_image (without skipping steps). Choosing perlin_init does not affect the actual diffusion process, just the starting point for the diffusion. Please note that selecting a perlin_init will replace and override any init_image you may have specified.  Further, because the 2D, 3D and video animation systems all rely on the init_image system, if you enable Perlin while using animation modes, the perlin_init will jump in front of any previous image or video input, and DD will NOT give you the expected sequence of coherent images. All of that said, using Perlin and animation modes together do make a very colorful rainbow effect, which can be used creatively.
     :param perlin_mode: sets type of Perlin noise: colored, gray, or a mix of both, giving you additional options for noise types. Experiment to see what these do in your projects.
@@ -158,17 +158,20 @@ def create(**kwargs) -> Optional['DocumentArray']:
 
     if 'init_document' in kwargs:
         d = kwargs['init_document']
+        _kwargs = {}
+        if d:
+            if isinstance(d, str):
+                d = DocumentArray.pull(d)[0]
+            elif isinstance(d, DocumentArray):
+                d = d[0]
 
-        if isinstance(d, str):
-            d = DocumentArray.pull(d)[0]
-
-        _kwargs = d.tags
-        if not _kwargs:
-            warnings.warn('init_document has no .tags, fallback to default config')
-        if d.uri:
-            _kwargs['init_image'] = d.uri
-        else:
-            warnings.warn('init_document has no .uri, fallback to no init image')
+            _kwargs = copy.deepcopy(d.tags)
+            if not _kwargs:
+                warnings.warn('init_document has no .tags, fallback to default config')
+            if d.uri:
+                _kwargs['init_image'] = d.uri
+            else:
+                warnings.warn('init_document has no .uri, fallback to no init image')
         kwargs.pop('init_document')
         if kwargs:
             warnings.warn(
@@ -189,6 +192,7 @@ def create(**kwargs) -> Optional['DocumentArray']:
         get_device,
         free_memory,
         show_result_summary,
+        get_output_dir,
     )
 
     device = get_device()
@@ -203,27 +207,28 @@ def create(**kwargs) -> Optional['DocumentArray']:
     secondary_model = load_secondary_model(_args, device=device)
 
     free_memory()
+    is_exit0 = False
     try:
         from .runner import do_run
 
-        return do_run(
+        da = do_run(
             _args,
             (model, diffusion, clip_models, secondary_model),
             device=device,
             events=events,
         )
+        is_exit0 = True
+        return da
     except KeyboardInterrupt:
-        pass
+        is_exit0 = True
     finally:
-        _name = _args.name_docarray
-
-        pb_path = os.path.join(
-            os.environ.get('DISCOART_OUTPUT_DIR', './'), f'{_name}.protobuf.lz4'
-        )
-
         free_memory()
 
-        if os.path.exists(pb_path):
+        _name = _args.name_docarray
+
+        pb_path = os.path.join(get_output_dir(_name), 'da.protobuf.lz4')
+
+        if os.path.exists(pb_path) and is_exit0:
             _da = DocumentArray.load_binary(pb_path)
 
             if (

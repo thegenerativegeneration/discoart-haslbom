@@ -99,12 +99,13 @@ The difference on the parameters between DiscoArt and DD5.6 [is explained here](
 
 ### Visualize results
 
-Final results and intermediate results are created under the current working directory, e.g.
+Final results and intermediate results are created under the current working directory, i.e.
 ```text
 ./{name-docarray}/{i}-done.png
 ./{name-docarray}/{i}-step-{j}.png
 ./{name-docarray}/{i}-progress.png
 ./{name-docarray}/{i}-progress.gif
+./{name-docarray}/da.protobuf.lz4
 ```
 
 ![](.github/result-persist.png)
@@ -114,9 +115,10 @@ where:
 - `name-docarray` is the name of the run, you can specify it otherwise it is a random name.
 - `i-*` is up to the value of `n_batches`.
 - `*-done-*` is the final image on done.
-- `*-step-*` is the intermediate image at certain step.
-- `*-progress.png` is the sprite image of all intermediate results so far.
-- `*-progress.gif` is the animated gif of all intermediate results so far.
+- `*-step-*` is the intermediate image at certain step, updated in real-time.
+- `*-progress.png` is the sprite image of all intermediate results so far, updated in real-time.
+- `*-progress.gif` is the animated gif of all intermediate results so far, updated in real-time.
+- `da.protobuf.lz4` is the compressed protobuf of all intermediate results so far, updated in real-time.
 
 The save frequency is controlled by `save_rate`.
 
@@ -184,9 +186,39 @@ da[0].chunks.save_gif(
 
 Note that >=0.7.14, a 20FPS gif is generated which includes all intermedidate steps. 
 
-### Export configs
+### Show/save/load configs
 
-You can review its parameters from `da[0].tags` or export it as an SVG image:
+To show the config of a Document/DocumentArray,
+
+```python
+from discoart import show_config
+
+show_config(da)  # show the config of the first run
+show_config(da[3])  # show the config of the fourth run
+show_config(
+    'discoart-06030a0198843332edc554ffebfbf288'
+)  # show the config of the run with a known DocArray ID
+```
+
+To save the config of a Document/DocumentArray,
+
+```python
+from discoart import save_config
+
+save_config(da, 'my.yml')  # save the config of the first run
+save_config(da[3], 'my.yml')  # save the config of the fourth run
+```
+
+To run `create` from a YAML config of Document/DocumentArray,
+
+```python
+from discoart import create, load_config
+
+config = load_config('my.yml')
+create(**config)
+```
+
+You can also export the config as an SVG image:
 
 ```python
 from discoart.config import save_config_svg
@@ -239,7 +271,6 @@ create(init_document='discoart-3205998582')
 ```
 
 
-
 ### Environment variables
 
 You can set environment variables to control the meta-behavior of DiscoArt. The environment variables must be set before importing DiscoArt, either in Bash or in Python via `os.environ`.
@@ -256,6 +287,7 @@ DISCOART_OUTPUT_DIR='path/to/your-output-dir' # use a custom output directory fo
 DISCOART_CACHE_DIR='path/to/your-cache-dir' # use a custom cache directory for models and downloads
 DISCOART_DISABLE_REMOTE_MODELS='1' # disable the listing of diffusion models on Github, remote diffusion models allows user to use latest models without updating the codebase.
 DISCOART_REMOTE_MODELS_URL='https://yourdomain/models.yml' # use a custom remote URL for fetching models list
+DISCOART_DISABLE_CHECK_MODEL_SHA='1' # disable checking local model SHA matches the remote model SHA
 ```
 
 ## CLI
@@ -471,6 +503,29 @@ da = c.post(
 # check intermediate results
 da = c.post('/result', parameters={'name_docarray': 'mydisco-123'})
 ```
+
+To use an existing Document/DocumentArray as init Document for `create`:
+
+```python
+from jina import Client
+
+c = Client(host='grpc://0.0.0.0:51001')
+
+old_da = create(...)
+
+da = c.post(
+    '/create',
+    old_da,  # this can be a DocumentArray or a single Document
+    parameters={
+        'width_height': [1024, 768],
+    },
+)
+```
+
+This equals to run `create(init_document=old_da, width_height=[1024, 768])` on the server. Note:
+- follow-up parameters have higher priorities than the parameters in `init_document`.
+- if `init_document` is a DocumentArray, then the first Document in the array will be used as the init Document.
+- there is no need to do any serialization before sending, Jina automatically handles it.
 
 ### Hosting on Google Colab
 

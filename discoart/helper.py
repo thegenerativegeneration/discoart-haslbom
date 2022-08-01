@@ -10,6 +10,7 @@ import urllib.request
 import warnings
 from os.path import expanduser
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Dict, Any, List, Tuple
 from urllib.request import Request, urlopen
 
@@ -171,7 +172,7 @@ def is_google_colab() -> bool:  # pragma: no cover
     return shell == 'Shell'
 
 
-def get_ipython_funcs():
+def get_ipython_funcs(show_widgets: bool = False):
     class NOP:
         def __call__(self, *args, **kwargs):
             return NOP()
@@ -181,19 +182,58 @@ def get_ipython_funcs():
     if is_jupyter():
         from IPython import display as dp1
         from IPython.display import FileLink as fl
-        from ipywidgets import HTML
 
-        return dp1, fl, HTML
+        handlers = None
+
+        if show_widgets:
+            from ipywidgets import HTML, IntProgress, Textarea, Tab
+
+            pg_bar = IntProgress(
+                value=1,
+                min=0,
+                max=4,
+                step=1,
+                description=f'n_batches:',
+                bar_style='info',  # 'success', 'info', 'warning', 'danger' or ''
+                orientation='horizontal',
+            )
+            html_handle = HTML()
+
+            nondefault_config_handle = HTML()
+            all_config_handle = HTML()
+            code_snippet_handle = Textarea(rows=20)
+            tab = Tab()
+            tab.children = [
+                html_handle,
+                nondefault_config_handle,
+                all_config_handle,
+                code_snippet_handle,
+            ]
+            for idx, j in enumerate(
+                ('Preview', 'Non-default config', 'Full config', 'Code snippet')
+            ):
+                tab.set_title(idx, j)
+
+            handlers = SimpleNamespace(
+                preview=html_handle,
+                config=nondefault_config_handle,
+                all_config=all_config_handle,
+                code=code_snippet_handle,
+                progress=pg_bar,
+            )
+
+        def redraw():
+            dp1.display(pg_bar, tab)
+
+        return dp1, fl, handlers, redraw
     else:
-        return NOP(), NOP(), NOP()
+        return NOP(), NOP(), NOP(), NOP()
 
 
 if not os.path.exists(cache_dir):
     Path(cache_dir).mkdir(parents=True, exist_ok=True)
 
 logger.debug(f'`.cache` dir is set to: {cache_dir}')
-
-check_model_SHA = False
 
 
 def _wget(url, outputdir):
@@ -281,9 +321,12 @@ def load_clip_models(
     return clip_models
 
 
-def _get_sha(path):
-    with open(path, 'rb') as f:
-        return hashlib.sha256(f.read()).hexdigest()
+def _check_sha(path, expected_sha):
+    if 'DISCOART_DISABLE_CHECK_MODEL_SHA' in os.environ:
+        return True
+    else:
+        with open(path, 'rb') as f:
+            return hashlib.sha256(f.read()).hexdigest() == expected_sha
 
 
 def _get_model_name(name: str) -> str:
@@ -306,15 +349,14 @@ def download_model(model_name: str):
 
     model_filename = os.path.basename(models_list[model_name]['sources'][0])
     model_local_path = os.path.join(cache_dir, model_filename)
-    if (
-        os.path.exists(model_local_path)
-        and _get_sha(model_local_path) == models_list[model_name]['sha']
+    if os.path.exists(model_local_path) and _check_sha(
+        model_local_path, models_list[model_name]['sha']
     ):
         logger.debug(f'{model_filename} is already downloaded with correct SHA')
     else:
         for url in models_list[model_name]['sources']:
             _wget(url, cache_dir)
-            if _get_sha(model_local_path) == models_list[model_name]['sha']:
+            if _check_sha(model_local_path, models_list[model_name]['sha']):
                 logger.debug(f'{model_filename} is downloaded with correct SHA')
                 break
 
@@ -353,7 +395,6 @@ def get_diffusion_config(user_args, device=torch.device('cuda:0')) -> Dict[str, 
                 'num_channels': 128,
                 'num_heads': 1,
                 'num_res_blocks': 2,
-                'use_checkpoint': True,
                 'use_scale_shift_norm': False,
             }
         )
@@ -365,6 +406,7 @@ def get_diffusion_config(user_args, device=torch.device('cuda:0')) -> Dict[str, 
             'use_fp16': device.type != 'cpu',
             'timestep_respacing': timestep_respacing,
             'diffusion_steps': diffusion_steps,
+            'use_checkpoint': True,
         }
     )
 
@@ -453,7 +495,7 @@ class PromptParser(SimpleTokenizer):
             vals = [prompt, 1]
         return vals[0], float(vals[1])
 
-    def parse(self, text: str) -> Tuple[str, float]:
+    def parse(self, text: str, on_misspelled_token=None) -> Tuple[str, float]:
         text, weight = self._split_weight(text)
         text = whitespace_clean(basic_clean(text)).lower()
         all_tokens = []
@@ -470,7 +512,8 @@ class PromptParser(SimpleTokenizer):
             for v in unknowns:
                 vc = self.spell.correction(v)
                 pairs.append((v, vc))
-                if self.on_misspelled_token == 'correct':
+                on_misspelled_token = on_misspelled_token or self.on_misspelled_token
+                if on_misspelled_token == 'correct':
                     for idx, ov in enumerate(all_tokens):
                         if ov == v:
                             all_tokens[idx] = vc
@@ -479,9 +522,9 @@ class PromptParser(SimpleTokenizer):
                 warning_str = '\n'.join(
                     f'Misspelled `{v}`, do you mean `{vc}`?' for v, vc in pairs
                 )
-                if self.on_misspelled_token == 'raise':
+                if on_misspelled_token == 'raise':
                     raise ValueError(warning_str)
-                elif self.on_misspelled_token == 'correct':
+                elif on_misspelled_token == 'correct':
                     logger.warning(
                         'auto-corrected the following tokens:\n' + warning_str
                     )
@@ -502,18 +545,19 @@ def free_memory():
 def show_result_summary(_da, _name, _args):
     from .config import print_args_table
 
-    _dp1, _fl, _ = get_ipython_funcs()
+    _dp1, _fl = get_ipython_funcs()[:2]
 
     _dp1.clear_output(wait=True)
 
     imcomplete_str = ''
 
     fully_done = sum(bool(j) for j in _da[:, 'tags___status__completed'])
-    if _da and fully_done < _args.n_batches:
+    num_expected = _args.n_batches * _args.batch_size
+    if _da and fully_done < num_expected:
         imcomplete_str = f'''
-# ⚠️ Incomplete result ({fully_done}/{_args.n_batches})
+# ⚠️ Incomplete result ({fully_done}/{num_expected})
 
-Your `n_batches={_args.n_batches}` so supposedly {_args.n_batches} images will be generated, 
+Your `n_batches={_args.n_batches}, batch_size={_args.batch_size}` so supposedly {num_expected} images will be generated, 
 but only {fully_done} images were fully completed. This may due to the following reasons:
 - You cancel the process before it finishes;
 - (On Google Colab) your GPU session is expired;
@@ -543,14 +587,8 @@ To save the full-size images, please check out the instruction in the next secti
     print_args_table(vars(_args))
 
     persist_file = _fl(
-        os.path.join(
-            os.environ.get('DISCOART_OUTPUT_DIR', './'), f'{_name}.protobuf.lz4'
-        ),
+        os.path.join(get_output_dir(_name), 'da.protobuf.lz4'),
         result_html_prefix=f'▶ Download the local backup (in case cloud storage failed): ',
-    )
-    config_file = _fl(
-        f'{_name}.svg',
-        result_html_prefix=f'▶ Download the config as SVG image: ',
     )
 
     md = Markdown(
@@ -559,12 +597,13 @@ To save the full-size images, please check out the instruction in the next secti
 
 # 🖼️ Save images
 
-Final results and intermediate results are created under the current working directory, e.g.
+Final results and intermediate results are created, i.e.
 ```text
 ./{_name}/[i]-done.png
 ./{_name}/[i]-step-[i].png
 ./{_name}/[i]-progress.gif
 ./{_name}/[i]-progress.png
+./{_name}/da.protobuf.lz4
 ```
 
 where:
@@ -574,7 +613,7 @@ where:
 - `*-step-*` is the intermediate image at certain step.
 - `*-progress.png` is the sprite image of all intermediate results so far.
 - `*-progress.gif` is the animated gif of all intermediate results so far.
-
+- `da.protobuf.lz4` is the LZ4 compressed Protobuf file of all intermediate results of all `n_batches`.
 
 # 💾 Save & load the batch        
 
@@ -584,7 +623,7 @@ Results are stored in a [DocumentArray](https://docarray.jina.ai/fundamentals/do
 You may also download the file manually and load it from local disk:
 
 ```python
-da = DocumentArray.load_binary('{_name}.protobuf.lz4')
+da = DocumentArray.load_binary('{get_output_dir(_name)}/da.protobuf.lz4')
 ```
 
 You can simply pull it from any machine:
@@ -603,7 +642,7 @@ More usage such as plotting, post-analysis can be found in the [README](https://
     if is_google_colab():
         _dp1.display(md)
     else:
-        _dp1.display(config_file, persist_file, md)
+        _dp1.display(persist_file, md)
 
 
 def list_diffusion_models():
@@ -648,3 +687,51 @@ def _version_check(package: str = None, github_repo: str = None):
 
 
 threading.Thread(target=_version_check, args=(__package__, 'discoart')).start()
+_MAX_DIFFUSION_STEPS = 1000
+
+
+def _eval_scheduling_str(val) -> List[float]:
+    if isinstance(val, str):
+        r = eval(val)
+    elif isinstance(val, (int, float, bool)):
+        r = [val] * _MAX_DIFFUSION_STEPS
+    else:
+        raise ValueError(f'unsupported scheduling type: {val}: {type(val)}')
+
+    if len(r) != _MAX_DIFFUSION_STEPS:
+        raise ValueError(
+            f'invalid scheduling string: {val} the schedule steps should be exactly {_MAX_DIFFUSION_STEPS}'
+        )
+    return r
+
+
+def _get_current_schedule(schedule_table: Dict, t: int) -> 'SimpleNamespace':
+    return SimpleNamespace(**{k: schedule_table[k][t] for k in schedule_table.keys()})
+
+
+def _get_schedule_table(args) -> Dict:
+    return {
+        k: _eval_scheduling_str(getattr(args, k))
+        for k in (
+            'cut_overview',
+            'cut_innercut',
+            'cut_icgray_p',
+            'cut_ic_pow',
+            'use_secondary_model',
+            'cutn_batches',
+            'skip_augs',
+            'clip_guidance_scale',
+            'tv_scale',
+            'range_scale',
+            'sat_scale',
+            'init_scale',
+            'clamp_grad',
+            'clamp_max',
+        )
+    }
+
+
+def get_output_dir(name_da):
+    output_dir = os.path.join(os.environ.get('DISCOART_OUTPUT_DIR', './'), name_da)
+    Path(output_dir).mkdir(parents=True, exist_ok=True)
+    return output_dir
