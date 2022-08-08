@@ -1,20 +1,18 @@
 import copy
 import os.path
-import random
+import tempfile
 import threading
+from typing import Callable, Optional
 
 import clip
 import lpips
-import numpy as np
 import torch
-import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 import wandb
 from docarray import DocumentArray, Document
 from torch.nn.functional import normalize as normalize_fn
 
-from . import __version__
-from .config import save_config_svg, default_args
+from .config import save_config_svg, export_python
 from .helper import (
     logger,
     get_ipython_funcs,
@@ -26,33 +24,34 @@ from .helper import (
     get_output_dir,
     is_jupyter,
 )
+from .nn.helper import set_seed, detach_gpu
 from .nn.losses import spherical_dist_loss, tv_loss, range_loss
-from .nn.make_cutouts import MakeCutoutsDango
+from .nn.make_cutouts import MakeCutouts
 from .nn.sec_diff import alpha_sigma_to_t
-from .nn.transform import symmetry_transformation_fn
+from .nn.transform import symmetry_transformation_fn, inv_normalize
 from .persist import _sample_thread, _persist_thread, _save_progress_thread
 from .prompt import PromptPlanner
 
 
-def do_run(args, models, device, events) -> 'DocumentArray':
+def do_run(
+    args, models, device, events, image_callback: Optional[Callable[[str], None]] = None
+) -> 'DocumentArray':
     skip_event, stop_event = events
+
+    _is_jupyter = is_jupyter()
 
     output_dir = get_output_dir(args.name_docarray)
 
     logger.info('preparing models...')
 
     model, diffusion, clip_models, secondary_model = models
-    normalize = T.Normalize(
-        mean=[0.48145466, 0.4578275, 0.40821073],
-        std=[0.26862954, 0.26130258, 0.27577711],
-    )
     lpips_model = lpips.LPIPS(net='vgg').to(device)
 
     side_x, side_y = ((args.width_height[j] // 64) * 64 for j in (0, 1))
 
     schedule_table = _get_schedule_table(args)
 
-    from .nn.perlin_noises import create_perlin_noise, regen_perlin
+    from .nn.perlin_noises import regen_perlin
 
     skip_steps = args.skip_steps
 
@@ -111,56 +110,17 @@ def do_run(args, models, device, events) -> 'DocumentArray':
 
     init = None
 
-    _set_seed(args.seed)
+    set_seed(args.seed)
     if args.init_image:
         d = Document(uri=args.init_image).load_uri_to_image_tensor(side_x, side_y)
-        init = TF.to_tensor(d.tensor).to(device).unsqueeze(0).mul(2).sub(1)
-
-    if args.perlin_init:
-        if args.perlin_mode == 'color':
-            init = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(12)],
-                1,
-                1,
-                False,
-                side_y,
-                side_x,
-                device,
-            )
-            init2 = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(8)], 4, 4, False, side_y, side_x, device
-            )
-        elif args.perlin_mode == 'gray':
-            init = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(12)], 1, 1, True, side_y, side_x, device
-            )
-            init2 = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(8)], 4, 4, True, side_y, side_x, device
-            )
-        else:
-            init = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(12)],
-                1,
-                1,
-                False,
-                side_y,
-                side_x,
-                device,
-            )
-            init2 = create_perlin_noise(
-                [1.5**-i * 0.5 for i in range(8)], 4, 4, True, side_y, side_x, device
-            )
-        # init = TF.to_tensor(init).add(TF.to_tensor(init2)).div(2).to(device)
         init = (
-            TF.to_tensor(init)
-            .add(TF.to_tensor(init2))
-            .div(2)
+            TF.to_tensor(d.tensor)
             .to(device)
             .unsqueeze(0)
             .mul(2)
             .sub(1)
+            .expand(args.batch_size, -1, -1, -1)
         )
-        del init2
 
     cur_t = None
 
@@ -172,6 +132,7 @@ def do_run(args, models, device, events) -> 'DocumentArray':
 
         num_step = _MAX_DIFFUSION_STEPS - t_int
         scheduler = _get_current_schedule(schedule_table, num_step)
+        is_cuts_visualized = False
 
         with torch.enable_grad():
 
@@ -198,19 +159,35 @@ def do_run(args, models, device, events) -> 'DocumentArray':
             fac = diffusion.sqrt_one_minus_alphas_cumprod[cur_t]
             x_in = out * fac + x * (1 - fac)
 
-            tv_losses = tv_loss(x_in).sum()
-            range_losses = range_loss(out).sum()
-            sat_losses = torch.abs(x_in - x_in.clamp(min=-1, max=1)).mean().sum()
-            loss = (
-                tv_losses * scheduler.tv_scale
-                + range_losses * scheduler.range_scale
-                + sat_losses * scheduler.sat_scale
-            )
-            if init is not None and scheduler.init_scale:
-                init_losses = lpips_model(x_in, init).sum()
-                loss += init_losses * scheduler.init_scale
+            if scheduler.tv_scale:
+                tv_losses = tv_loss(x_in).sum() * scheduler.tv_scale
+            else:
+                tv_losses = 0
 
-            x_in_grad = torch.autograd.grad(loss, x_in)[0]
+            if scheduler.range_scale:
+                range_losses = range_loss(x_in).sum() * scheduler.range_scale
+            else:
+                range_losses = 0
+
+            if scheduler.sat_scale:
+                sat_losses = (
+                    torch.abs(x_in - x_in.clamp(min=-1, max=1)).mean().sum()
+                    * scheduler.sat_scale
+                )
+            else:
+                sat_losses = 0
+
+            if init is not None and scheduler.init_scale:
+                init_losses = lpips_model(x_in, init).sum() * scheduler.init_scale
+            else:
+                init_losses = 0
+
+            loss = tv_losses + range_losses + sat_losses + init_losses
+
+            if loss != 0:
+                x_in_grad = torch.autograd.grad(loss, x_in)[0]
+            else:
+                x_in_grad = 0
 
             cut_losses = 0
 
@@ -239,16 +216,29 @@ def do_run(args, models, device, events) -> 'DocumentArray':
                 else:
                     continue
 
+                cuts = MakeCutouts(
+                    model_stat['input_resolution'],
+                    Overview=scheduler.cut_overview,
+                    InnerCrop=scheduler.cut_innercut,
+                    IC_Size_Pow=scheduler.cut_ic_pow,
+                    IC_Grey_P=scheduler.cut_icgray_p,
+                )
+
                 for _ in range(scheduler.cutn_batches):
-                    cuts = MakeCutoutsDango(
-                        model_stat['input_resolution'],
-                        Overview=scheduler.cut_overview,
-                        InnerCrop=scheduler.cut_innercut,
-                        IC_Size_Pow=scheduler.cut_ic_pow,
-                        IC_Grey_P=scheduler.cut_icgray_p,
-                        skip_augs=scheduler.skip_augs,
-                    )
-                    clip_in = normalize(cuts(x_in.add(1).div(2)))
+
+                    clip_in = cuts(x_in.add(1).div(2))
+
+                    if args.visualize_cuts and not is_cuts_visualized:
+                        _cuts_da = DocumentArray.empty(clip_in.shape[0])
+                        _cuts_da.tensors = (
+                            (inv_normalize(clip_in) * 255).detach().cpu().numpy()
+                        )
+                        _cuts_da.plot_image_sprites(
+                            os.path.join(output_dir, f'{_nb}-cuts-{num_step}.png'),
+                            show_index=True,
+                            channel_axis=0,
+                        )
+                        is_cuts_visualized = True
 
                     image_embeds = (
                         model_stat['clip_model'].encode_image(clip_in).unsqueeze(1)
@@ -267,45 +257,44 @@ def do_run(args, models, device, events) -> 'DocumentArray':
                         ]
                     )
 
-                    cut_loss = dists.mul(masked_weights).sum(2).mean(0).sum()
-
-                    x_in_grad += torch.autograd.grad(
-                        cut_loss
+                    cut_loss = (
+                        dists.mul(masked_weights).sum(2).mean(0).sum()
                         * scheduler.clip_guidance_scale
-                        / scheduler.cutn_batches,
-                        x_in,
-                    )[0]
+                        / scheduler.cutn_batches
+                    )
+
+                    x_in_grad += torch.autograd.grad(cut_loss, x_in)[0]
 
                     cut_losses += cut_loss.detach().item()
 
         x_is_NaN = False
-        if not torch.isnan(x_in_grad).any():
+        if isinstance(x_in_grad, int) and x_in_grad == 0:
+            grad = torch.zeros_like(x)
+        elif not torch.isnan(x_in_grad).any():
             grad = -torch.autograd.grad(x_in, x, x_in_grad)[0]
         else:
             x_is_NaN = True
             grad = torch.zeros_like(x)
             logger.warning(
-                f'NaN detected in grad at the diffusion inner-step {num_step}, '
-                f'if this message continues to show up, '
-                f'then your image is not updated and further steps are unnecessary.'
+                f'NaN detected in grad at the diffusion inner-step {num_step}, no panic. '
+                f'However, if this message continues to show up *in a row*, '
+                f'then your generation is ill-conditioned and image will not updated, further steps are unnecessary.'
             )
 
         r_grad = grad
         if scheduler.clamp_grad and not x_is_NaN:
-            magnitude = grad.square().mean().sqrt()
+            magnitude = r_grad.square().mean().sqrt()
             r_grad = (
                 grad * magnitude.clamp(max=scheduler.clamp_max) / magnitude
             )  # min=-0.02, min=-clamp_max,
 
         traced_info = {
-            'losses/total': loss.detach().item() + cut_losses,
-            'losses/tv': tv_losses.detach().item(),
-            'losses/range': range_losses.detach().item(),
-            'losses/sat': sat_losses.detach().item(),
-            'losses/init': init_losses.detach().item()
-            if init is not None and scheduler.init_scale
-            else 0,
-            'losses/cuts': cut_losses,
+            'losses/total': detach_gpu(loss) + cut_losses,
+            'losses/tv': detach_gpu(tv_losses),
+            'losses/range': detach_gpu(range_losses),
+            'losses/sat': detach_gpu(sat_losses),
+            'losses/init': detach_gpu(init_losses),
+            'losses/cuts': detach_gpu(cut_losses),
         }
 
         traced_info.update(
@@ -358,20 +347,21 @@ scheduling tracking, please set `WANDB_MODE=online` before running/importing Dis
 
         # set seed for each image in the batch
         new_seed = org_seed + _nb
-        _set_seed(new_seed)
+        set_seed(new_seed)
         args.seed = new_seed
-        if is_jupyter():
+        if _is_jupyter:
             redraw_widget(
                 _handlers,
                 _redraw_fn,
                 args,
-                output_dir,
                 _nb,
             )
         free_memory()
 
-        _da = [Document(tags=copy.deepcopy(vars(args))) for _ in range(args.batch_size)]
-        _da_gif = [Document() for _ in range(args.batch_size)]
+        _da = DocumentArray(
+            [Document(tags=copy.deepcopy(vars(args))) for _ in range(args.batch_size)]
+        )
+        _da_gif = DocumentArray([Document() for _ in range(args.batch_size)])
         da_batches.extend(_da)
 
         cur_t = diffusion.num_timesteps - skip_steps - 1
@@ -388,7 +378,7 @@ scheduling tracking, please set `WANDB_MODE=online` before running/importing Dis
                 clip_denoised=args.clip_denoised,
                 model_kwargs={},
                 cond_fn=cond_fn,
-                progress=True,
+                progress='DISCOART_DISABLE_TQDM' not in os.environ,
                 skip_timesteps=skip_steps,
                 init_image=init,
                 randomize_class=args.randomize_class,
@@ -405,7 +395,7 @@ scheduling tracking, please set `WANDB_MODE=online` before running/importing Dis
                 clip_denoised=args.clip_denoised,
                 model_kwargs={},
                 cond_fn=cond_fn,
-                progress=True,
+                progress='DISCOART_DISABLE_TQDM' not in os.environ,
                 skip_timesteps=skip_steps,
                 init_image=init,
                 randomize_class=args.randomize_class,
@@ -429,9 +419,10 @@ scheduling tracking, please set `WANDB_MODE=online` before running/importing Dis
 
                 cur_t -= 1
 
-                is_save_step = (
-                    j % (args.display_rate or args.save_rate) == 0 or cur_t == -1
-                )
+                is_save_step = args.save_rate > 0 and j % args.save_rate == 0
+                is_complete = cur_t == -1
+                is_display_step = args.display_rate > 0 and j % args.display_rate == 0
+
                 threads.append(
                     _sample_thread(
                         sample,
@@ -444,28 +435,34 @@ scheduling tracking, please set `WANDB_MODE=online` before running/importing Dis
                         loss_values,
                         output_dir,
                         is_busy_evs[0],
-                        is_save_step,
+                        is_save_step or is_complete,
+                        args.gif_fps > 0,
+                        args.image_output,
+                        is_display_step,
+                        image_callback,
                     )
                 )
 
-                if is_save_step:
-                    threads.append(
-                        _save_progress_thread(
-                            _da,
-                            _da_gif,
-                            _nb,
-                            output_dir,
-                            args.gif_fps,
-                            args.gif_size_ratio,
+                if is_complete or is_save_step:
+                    if args.image_output:
+                        threads.append(
+                            _save_progress_thread(
+                                _da,
+                                _da_gif,
+                                _nb,
+                                output_dir,
+                                args.gif_fps,
+                                args.gif_size_ratio,
+                            )
                         )
-                    )
+
                     threads.extend(
                         _persist_thread(
                             da_batches,
                             args.name_docarray,
                             is_busy_evs[1:],
                             is_busy_evs[0],
-                            is_completed=cur_t == -1,
+                            is_completed=is_complete,
                         )
                     )
 
@@ -483,48 +480,19 @@ scheduling tracking, please set `WANDB_MODE=online` before running/importing Dis
     return da_batches
 
 
-def redraw_widget(_handlers, _redraw_fn, args, output_dir, _nb):
+def redraw_widget(_handlers, _redraw_fn, args, _nb):
     _handlers.progress.max = args.n_batches
     _handlers.progress.value = _nb + 1
-    _handlers.progress.description = f'Generating {_nb + 1}/{args.n_batches}: '
+    _handlers.progress.description = f'Baking {_nb + 1}/{args.n_batches}: '
 
-    svg0 = os.path.join(output_dir, 'config.svg')
-    save_config_svg(args, svg0, only_non_default=True)
-    d = Document(uri=svg0).convert_uri_to_datauri()
+    svg_name = f'{os.path.join(tempfile.gettempdir(), args.name_docarray)}.svg'
+    save_config_svg(args, svg_name, only_non_default=True)
+    d = Document(uri=svg_name).convert_uri_to_datauri()
     _handlers.config.value = f'<img src="{d.uri}" alt="non-default config">'
-    svg1 = os.path.join(output_dir, 'all-config.svg')
-    save_config_svg(args, svg1)
-    d = Document(uri=svg1).convert_uri_to_datauri()
+
+    save_config_svg(args, svg_name)
+    d = Document(uri=svg_name).convert_uri_to_datauri()
     _handlers.all_config.value = f'<img src="{d.uri}" alt="all config">'
 
-    non_defaults = {}
-    taboo = {'name_docarray'}
-    for k, v in vars(args).items():
-        if k.startswith('_') or k in taboo:
-            continue
-
-        if not default_args.get(k, None) == v:
-            non_defaults[k] = v
-
-    kwargs_string = ',\n    '.join(
-        f'{k}=\'{v}\'' if isinstance(v, str) else f'{k}={v}'
-        for k, v in non_defaults.items()
-    )
-    _handlers.code.value = f'''
-#!pip install docarray=={__version__}
-
-from discoart import create
-
-da = create(
-    {kwargs_string}
-)    
-    '''
+    _handlers.code.value = export_python(args)
     _redraw_fn()
-
-
-def _set_seed(seed: int) -> None:
-    np.random.seed(seed)
-    random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True

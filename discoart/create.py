@@ -39,10 +39,11 @@ def create(
     diffusion_model: Optional[str] = '512x512_diffusion_uncond_finetune_008100',
     diffusion_model_config: Optional[Dict[str, Any]] = None,
     diffusion_sampling_mode: Optional[str] = 'ddim',
-    display_rate: Optional[int] = None,
+    display_rate: Optional[int] = 1,
     eta: Optional[float] = 0.8,
     gif_fps: Optional[int] = 20,
     gif_size_ratio: Optional[float] = 0.5,
+    image_output: Optional[bool] = True,
     init_document: Optional[Union['Document', 'DocumentArray']] = None,
     init_image: Optional[str] = None,
     init_scale: Optional[Union[int, str]] = 1000,
@@ -57,7 +58,6 @@ def create(
     sat_scale: Optional[Union[int, str]] = 0,
     save_rate: Optional[int] = 20,
     seed: Optional[int] = None,
-    skip_augs: Optional[Union[bool, str]] = False,
     skip_event: Optional[
         Union['multiprocessing.Event', 'asyncio.Event', 'threading.Event']
     ] = None,
@@ -77,6 +77,7 @@ def create(
     use_horizontal_symmetry: Optional[bool] = False,
     use_secondary_model: Optional[Union[bool, str]] = True,
     use_vertical_symmetry: Optional[bool] = False,
+    visualize_cuts: Optional[bool] = False,
     width_height: Optional[List[int]] = [1280, 768],
 ) -> Optional['DocumentArray']:
 
@@ -113,10 +114,11 @@ def create(**kwargs) -> Optional['DocumentArray']:
     :param diffusion_model: Diffusion_model of choice. Note that you don't have to write the full name of the diffusion model, e.g. any prefix is enough.To use a listed all diffusion models, you can do:```pythonfrom discoart import createcreate(diffusion_model='portrait_generator', ...)```
     :param diffusion_model_config: [DiscoArt] The customized diffusion model config as a dictionary, if specified will override the values with the same name in the default model config.
     :param diffusion_sampling_mode: Two alternate diffusion denoising algorithms. ddim has been around longer, and is more established and tested.  plms is a newly added alternate method that promises good diffusion results in fewer steps, but has not been as fully tested and may have side effects. This new plms mode is actively being researched in the #settings-and-techniques channel in the DD Discord.
-    :param display_rate: [DiscoArt] Display rate is deprecated in DiscoArt as it is always 1, meaning display is always in real-time. There is no need to worry on the speed as the rendering happens in another thread. To control the save rate, use the `save_rate` parameter.Setting this will override the `save_rate` parameter.
+    :param display_rate: [DiscoArt] The refresh rate of displaying the generated images in Notebook environment. The value has nothing to do with the rate of saving images and the speed of generation or sampling. It is purely about your browser refreshing. Smaller value (1 is the smallest, 0 will disable the refresh) will consume more network bandwidth, as your browser will actively fetch refreshed images to local. Change it to a bigger value if you have limited network bandwidth.
     :param eta: eta (greek letter η) is a diffusion model variable that mixes in a random amount of scaled noise into each timestep. 0 is no noise, 1.0 is more noise. As with most DD parameters, you can go below zero for eta, but it may give you unpredictable results. The steps parameter has a close relationship with the eta parameter. If you set eta to 0, then you can get decent output with only 50-75 steps. Setting eta to 1.0 favors higher step counts, ideally around 250 and up. eta has a subtle, unpredictable effect on image, so you’ll need to experiment to see how this affects your projects.
-    :param gif_fps: [DiscoArt] The frame rate of the generated GIF.
+    :param gif_fps: [DiscoArt] The frame rate of the generated GIF. Set it to -1 for not saving GIF.
     :param gif_size_ratio: [DiscoArt] The relative size vs. the original image, small size ratio gives smaller file size.
+    :param image_output: [DiscoArt] If set, then output will be saved as images. This includes intermediate, final results in the form of PNG and GIF. If set to False, then no images will be saved, everything will be saved in a Protobuf LZ4 format. https://docarray.jina.ai/fundamentals/documentarray/serialization/#from-to-bytes
     :param init_document: [DiscoArt] Use a Document object as the initial state for DD: its ``.tags`` will be used as parameters, ``.uri`` (if present) will be used as init image.
     :param init_image: Recall that in the image sequence above, the first image shown is just noise.  If an init_image is provided, diffusion will replace the noise with the init_image as its starting state.  To use an init_image, upload the image to the Colab instance or your Google Drive, and enter the full image path here. If using an init_image, you may need to increase skip_steps to ~ 50% of total steps to retain the character of the init. See skip_steps above for further discussion.
     :param init_scale: This controls how strongly CLIP will try to match the init_image provided.  This is balanced against the clip_guidance_scale (CGS) above.  Too much init scale, and the image won’t change much during diffusion. Too much CGS and the init image will be lost.[DiscoArt] Can be scheduled via syntax `[val1]*400+[val2]*600`.
@@ -129,9 +131,8 @@ def create(**kwargs) -> Optional['DocumentArray']:
     :param randomize_class: Controls whether the imagenet class is randomly changed each iteration
     :param range_scale: Optional, set to zero to turn off.  Used for adjustment of color contrast.  Lower range_scale will increase contrast. Very low numbers create a reduced color palette, resulting in more vibrant or poster-like images. Higher range_scale will reduce contrast, for more muted images.[DiscoArt] Can be scheduled via syntax `[val1]*400+[val2]*600`.
     :param sat_scale: Saturation scale. Optional, set to zero to turn off.  If used, sat_scale will help mitigate oversaturation. If your image is too saturated, increase sat_scale to reduce the saturation.[DiscoArt] Can be scheduled via syntax `[val1]*400+[val2]*600`.
-    :param save_rate: [DiscoArt] The number of steps to save intermediate results. It is a replacement to original `display_rate` parameter.
+    :param save_rate: [DiscoArt] The number of steps to save intermediate results. It is a replacement to original `display_rate` parameter. Set it to -1 for not saving any intermediate result.
     :param seed: Deep in the diffusion code, there is a random number ‘seed’ which is used as the basis for determining the initial state of the diffusion.  By default, this is random, but you can also specify your own seed.  This is useful if you like a particular result and would like to run more iterations that will be similar. After each run, the actual seed value used will be reported in the parameters report, and can be reused if desired by entering seed # here.  If a specific numerical seed is used repeatedly, the resulting images will be quite similar but not identical.
-    :param skip_augs: Controls whether to skip torchvision augmentations.[DiscoArt] Can be scheduled via syntax `[val1]*400+[val2]*600`.
     :param skip_event: [DiscoArt] A multiprocessing/asyncio/threading.Event that once set, will skip the current run and move to the next run as defined in `n_batches`.
     :param skip_steps: Consider the chart shown here.  Noise scheduling (denoise strength) starts very high and progressively gets lower and lower as diffusion steps progress. The noise levels in the first few steps are very high, so images change dramatically in early steps.As DD moves along the curve, noise levels (and thus the amount an image changes per step) declines, and image coherence from one step to the next increases.The first few steps of denoising are often so dramatic that some steps (maybe 10-15% of total) can be skipped without affecting the final image. You can experiment with this as a way to cut render times.If you skip too many steps, however, the remaining noise may not be high enough to generate new content, and thus may not have ‘time left’ to finish an image satisfactorily.Also, depending on your other settings, you may need to skip steps to prevent CLIP from overshooting your goal, resulting in ‘blown out’ colors (hyper saturated, solid white, or solid black regions) or otherwise poor image quality.  Consider that the denoising process is at its strongest in the early steps, so skipping steps can sometimes mitigate other problems.Lastly, if using an init_image, you will need to skip ~50% of the diffusion steps to retain the shapes in the original init image. However, if you’re using an init_image, you can also adjust skip_steps up or down for creative reasons.  With low skip_steps you can get a result "inspired by" the init_image which will retain the colors and rough layout and shapes but look quite different. With high skip_steps you can preserve most of the init_image contents and just do fine tuning of the texture.
     :param steps: When creating an image, the denoising curve is subdivided into steps for processing. Each step (or iteration) involves the AI looking at subsets of the image called ‘cuts’ and calculating the ‘direction’ the image should be guided to be more like the prompt. Then it adjusts the image with the help of the diffusion denoiser, and moves to the next step.Increasing steps will provide more opportunities for the AI to adjust the image, and each adjustment will be smaller, and thus will yield a more precise, detailed image.  Increasing steps comes at the expense of longer render times.  Also, while increasing steps should generally increase image quality, there is a diminishing return on additional steps beyond 250 - 500 steps.  However, some intricate images can take 1000, 2000, or more steps.  It is really up to the user.  Just know that the render time is directly related to the number of steps, and many other parameters have a major impact on image quality, without costing additional time.
@@ -144,6 +145,7 @@ def create(**kwargs) -> Optional['DocumentArray']:
     :param use_horizontal_symmetry: Enforce symmetry over y axis of the image on [tr_ststeps for tr_st in transformation_steps] steps of the diffusion process
     :param use_secondary_model: Option to use a secondary purpose-made diffusion model to clean up interim diffusion images for CLIP evaluation.    If this option is turned off, DD will use the regular (large) diffusion model.    Using the secondary model is faster - one user reported a 50% improvement in render speed! However, the secondary model is much smaller, and may reduce image quality and detail.  I suggest you experiment with this.[DiscoArt] It can be also an boolean list schedule that represents on/off on secondary model at each step, same as `clip_models_schedules` or `cut_overview`.Note that without secondary model it will consume higher VRAM but gives better quality. Simply put, secondary model is faster, but a less accurate approximation to `p_mean_variance`.
     :param use_vertical_symmetry: Enforce symmetry over x axis of the image on [tr_ststeps for tr_st in transformation_steps] steps of the diffusion process
+    :param visualize_cuts: [DiscoArt] If set, then `cuts-{step}.png` will be saved for each step, visualizing all cuts in a sprite image at each step.
     :param width_height: Desired final image size, in pixels. You can have a square, wide, or tall image, but each edge length should be set to a multiple of 64px, and a minimum of 512px on the default CLIP model setting.  If you forget to use multiples of 64px in your dimensions, DD will adjust the dimensions of your image to make it so.
     :return: a DocumentArray object that has `n_batches` Documents
     """

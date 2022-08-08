@@ -20,7 +20,6 @@ import torch
 import yaml
 from clip.simple_tokenizer import SimpleTokenizer, whitespace_clean, basic_clean
 from packaging.version import Version
-
 from spellchecker import SpellChecker
 from tqdm.auto import tqdm
 
@@ -177,7 +176,7 @@ def get_ipython_funcs(show_widgets: bool = False):
         def __call__(self, *args, **kwargs):
             return NOP()
 
-        __getattr__ = __enter__ = __exit__ = __call__
+        __getattr__ = __enter__ = __exit__ = __iadd__ = __add__ = __call__
 
     if is_jupyter():
         from IPython import display as dp1
@@ -201,6 +200,8 @@ def get_ipython_funcs(show_widgets: bool = False):
 
             nondefault_config_handle = HTML()
             all_config_handle = HTML()
+            completed_handle = HTML()
+            completed_handle.value = '<h4>Completed images will be displayed below</h4>'
             code_snippet_handle = Textarea(rows=20)
             tab = Tab()
             tab.children = [
@@ -208,9 +209,16 @@ def get_ipython_funcs(show_widgets: bool = False):
                 nondefault_config_handle,
                 all_config_handle,
                 code_snippet_handle,
+                completed_handle,
             ]
             for idx, j in enumerate(
-                ('Preview', 'Non-default config', 'Full config', 'Code snippet')
+                (
+                    'Preview',
+                    'Non-default config',
+                    'Full config',
+                    'Code snippet',
+                    'Completed',
+                )
             ):
                 tab.set_title(idx, j)
 
@@ -219,6 +227,7 @@ def get_ipython_funcs(show_widgets: bool = False):
                 config=nondefault_config_handle,
                 all_config=all_config_handle,
                 code=code_snippet_handle,
+                completed=completed_handle,
                 progress=pg_bar,
             )
 
@@ -279,7 +288,7 @@ def load_clip_models(
     # load enabled models
     for k in enabled:
         if k not in clip_models:
-            if '::' in k and k.split('::')[-1] != 'openai':
+            if '::' in k and (k.split('::')[-1] != 'openai' or '-quickgelu' in k):
                 # use open_clip loader
                 k1, k2 = k.split('::')
                 logger.debug(f'use open_clip to load {k1}')
@@ -690,19 +699,32 @@ threading.Thread(target=_version_check, args=(__package__, 'discoart')).start()
 _MAX_DIFFUSION_STEPS = 1000
 
 
+def _is_valid_schedule_str(val) -> bool:
+    r = re.match(r'(False\b|True\b|[\(\)\[\]0-9\, \.\*\+\-])+', val)
+    if r and r.group(0) == val:
+        return True
+    return False
+
+
 def _eval_scheduling_str(val) -> List[float]:
     if isinstance(val, str):
-        r = eval(val)
-    elif isinstance(val, (int, float, bool)):
-        r = [val] * _MAX_DIFFUSION_STEPS
+        if _is_valid_schedule_str(val):
+            val = eval(val)
+        else:
+            raise ValueError(
+                f'invalid scheduling string: {val}, it contains unsafe code'
+            )
+
+    if isinstance(val, (int, float, bool)):
+        val = [val] * _MAX_DIFFUSION_STEPS
+    elif isinstance(val, (list, tuple)):
+        if len(val) != _MAX_DIFFUSION_STEPS:
+            raise ValueError(
+                f'invalid scheduling string: {val} the schedule steps should be exactly {_MAX_DIFFUSION_STEPS}'
+            )
     else:
         raise ValueError(f'unsupported scheduling type: {val}: {type(val)}')
-
-    if len(r) != _MAX_DIFFUSION_STEPS:
-        raise ValueError(
-            f'invalid scheduling string: {val} the schedule steps should be exactly {_MAX_DIFFUSION_STEPS}'
-        )
-    return r
+    return val
 
 
 def _get_current_schedule(schedule_table: Dict, t: int) -> 'SimpleNamespace':
@@ -719,7 +741,6 @@ def _get_schedule_table(args) -> Dict:
             'cut_ic_pow',
             'use_secondary_model',
             'cutn_batches',
-            'skip_augs',
             'clip_guidance_scale',
             'tv_scale',
             'range_scale',

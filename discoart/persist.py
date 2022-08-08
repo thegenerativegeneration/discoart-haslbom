@@ -29,6 +29,10 @@ def _sample(
     output_dir,
     is_sampling_done,
     is_save_step,
+    is_save_gif,
+    is_image_output,
+    is_display_step,
+    image_callback,
 ):
     with threading.Lock():
         is_sampling_done.clear()
@@ -49,18 +53,23 @@ def _sample(
             ).load_pil_image_to_datauri(image)
 
             if is_save_step:
-                if cur_t == -1:
-                    c.save_uri_to_file(os.path.join(output_dir, f'{_nb}-done-{k}.png'))
-                else:
-                    c.save_uri_to_file(
-                        os.path.join(output_dir, f'{_nb}-step-{j}-{k}.png')
-                    )
+                if is_image_output:
+                    if cur_t == -1:
+                        f_name = os.path.join(output_dir, f'{_nb}-done-{k}.png')
+                    else:
+                        f_name = os.path.join(output_dir, f'{_nb}-step-{j}-{k}.png')
+                    c.save_uri_to_file(f_name)
+
+                    if callable(image_callback):
+                        image_callback(f_name)
 
                 da[k].chunks.append(c)
-                # root doc always update with the latest progress
-                da[k].uri = c.uri
-            else:
+
+            if is_save_gif and is_image_output:
                 da_gif[k].chunks.append(c)
+
+            # root doc always update with the latest progress
+            da[k].uri = c.uri
 
             da[k].tags['_status'] = {
                 'completed': cur_t == -1,
@@ -71,7 +80,12 @@ def _sample(
 
             _display_html.append(f'<img src="{c.uri}" alt="step {j} minibatch {k}">')
 
-        _handlers.preview.value = '<br>\n'.join(_display_html)
+            if cur_t == -1:
+                _handlers.completed.value += f'<br>seed: {da[k].tags["seed"]}<br><img src="{c.uri}" alt="step {j} minibatch {k}"><br>'
+
+        if is_display_step:
+            _handlers.preview.value = '<br>\n'.join(_display_html)
+
         logger.debug('sample and plot is done')
         is_sampling_done.set()
 
